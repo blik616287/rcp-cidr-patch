@@ -1,0 +1,93 @@
+# Sample RCP config.yaml with host_subnet_size parameter
+#
+# This configuration file demonstrates the new host_subnet_size parameter
+# that allows configurable subnet sizes for host IP allocation.
+#
+
+# Simulation mode (set to true for NVIDIA AIR simulations)
+is_simulation: true
+
+# Pod configuration
+pod_num: 1
+pod_size: 1
+
+# Topology type: "2-tier", "3-tier", "2-tier-poc", "2-tier-custom"
+topology: "2-tier-poc"
+
+# System and HCA type
+system_type: "h100"
+hca_type: "BlueField-3"
+
+# Host network interfaces
+host_interfaces: ["eth1", "eth2", "eth3", "eth4"]
+
+# First octet for host IP addresses (cannot be 10 or 100)
+host_first_octet: 172
+
+# Overlay configuration
+overlay: false
+
+# Leaf switch configuration
+leaf_rails: 2
+
+# Telemetry settings
+telemetry_histogram: false
+cable_validator: false
+telemetry_dts_host_enable: false
+
+# Switch configuration
+switch_nos: "cumulus"
+switch_breakout: 2
+leaf_downlinks_breakout: 2
+planes_num: 1
+
+# IP version
+ip_version: "ipv4"
+
+# Host configurator (netplan or dms)
+host_configurator: "netplan"
+
+# ============================================================================
+# NEW PARAMETER: host_subnet_size
+# ============================================================================
+#
+# Controls the subnet size for host-to-switch IP allocation.
+# This determines how many IP addresses are available per host per rail.
+#
+# Supported values:
+#   31 (default) - /31 subnet, 2 addresses per block
+#                  1 for host, 1 for switch
+#                  Use case: Host-level only (no container networking)
+#
+#   30           - /30 subnet, 4 addresses per block
+#                  1 for host base, 1 for switch, 2 extra for containers
+#                  Use case: 2 GPUs running 1 pod each
+#
+#   29           - /29 subnet, 8 addresses per block
+#                  1 for host base, 1 for switch, 6 extra for containers
+#                  Use case: 4+ GPUs running 1 pod each
+#
+# IP Address Layout Example (for host index 0, rail 0):
+#
+#   /31 (default):
+#     172.16.0.0 - Host
+#     172.16.0.1 - Switch
+#
+#   /30:
+#     172.16.0.0 - Host base IP
+#     172.16.0.1 - Switch
+#     172.16.0.2 - Container/Pod IP 1
+#     172.16.0.3 - Container/Pod IP 2
+#
+#   /29:
+#     172.16.0.0 - Host base IP
+#     172.16.0.1 - Switch
+#     172.16.0.2 - Container/Pod IP 1
+#     172.16.0.3 - Container/Pod IP 2
+#     172.16.0.4 - Container/Pod IP 3
+#     172.16.0.5 - Container/Pod IP 4
+#     172.16.0.6 - Container/Pod IP 5
+#     172.16.0.7 - Container/Pod IP 6
+#
+# ============================================================================
+host_subnet_size: 30
