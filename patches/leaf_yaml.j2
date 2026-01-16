@@ -1,0 +1,254 @@
+{% set interfaces_template_path = switch_templates_path ~ '/cumulus/interfaces.j2' %}
+{% set leaf_interfaces_template_path = switch_templates_path ~ '/cumulus/leaf_interfaces.j2' %}
+{% set port_list = lookup('template', leaf_interfaces_template_path) %}
+{{ lookup('template', initial_yaml_path) }}
+      lo:
+        ip:
+          address:
+            {{ node_info["loopback_ip"] }}/32: {}
+{% if ip_version == "ipv6" %}
+            {{ node_info["loopback_ipv6_ip"] }}/128: {}
+{% endif %}
+        type: loopback
+      swp1-32:
+        link:
+          breakout:
+            {{ leaf_downlinks_breakout }}x: {}
+      swp33-64:
+        link:
+          breakout:
+            {{ switch_breakout }}x: {}
+      ? swp1-64,{{ port_list }}
+      : type: swp
+        link:
+          state:
+            up: {}
+{% for port, port_info in node_info["ports"].items() %}
+      {{ port }}:
+        description:
+            to_{{ port_info["peer_node"] }}_{{ port_info["peer_port"] }}
+        ip:
+          address:
+{% if ip_version == "ipv4" %}
+            {% if port_info["peer_role"] == "host" %}{{ port_info["ip_address"] }}/{{ port_info["subnet"] }}{% else %}{{ port_info["ip_address"] }}/31{% endif %}: {}
+{% else %}
+{% if node_info["ports"][port]["peer_role"] == "host" %}
+            {{ node_info["ports"][port]["ip_address"] }}/64: {}
+{% else %}
+            {{ node_info["ports"][port]["ip_address"] }}/127: {}
+{% endif %}
+{% endif %}
+{% if telemetry_otlp_destinations is defined and telemetry_otlp_destinations and port in recommended_node_info["ports"] %}
+        telemetry:
+          label:
+            destination:
+              description: {{ recommended_node_info["ports"][port]["peer_node"] }}
+            destination_port:
+              description: {{ recommended_node_info["ports"][port]["peer_port"] }}
+            port_type:
+              description: {{ recommended_node_info["ports"][port]["link_type"] }}
+            plane:
+              description: "{{ recommended_node_info["ports"][port]["plane"] }}"
+{% endif %}
+{% endfor %}
+{% if telemetry_otlp_destinations is defined and telemetry_otlp_destinations %}
+{% for reco_port, reco_port_info in recommended_node_info["ports"].items() %}
+{% if reco_port not in node_info["ports"] %}
+      {{ reco_port }}:
+        telemetry:
+          label:
+            destination:
+              description: {{ reco_port_info["peer_node"] }}
+            destination_port:
+              description: {{ reco_port_info["peer_port"] }}
+            port_type:
+              description: {{ reco_port_info["link_type"] }}
+            plane:
+              description: "{{ reco_port_info["plane"] }}"
+{% endif %}
+{% endfor %}
+{% endif %}
+      ? {{ port_list }}
+      : qos:
+          pfc-watchdog:
+            state: enable
+{% if telemetry_histogram != 'none' %}
+        telemetry:
+          bw-gauge:
+            enable: on
+          histogram:
+            counter:
+              counter-type:
+                rx-byte:
+                  bin-min-boundary: 3552
+                  histogram-size: 55008
+                  sample-interval: 1024
+                tx-byte:
+                  bin-min-boundary: 3552
+                  histogram-size: 55008
+                  sample-interval: 1024
+            egress-buffer:
+              traffic-class:
+{% if telemetry_histogram != 'netq' %}
+                '0': {}
+{% endif %}
+                '3': {}
+{% if telemetry_histogram != 'netq' %}
+                '6': {}
+{% endif %}
+            ingress-buffer:
+              priority-group:
+                '0': {}
+                '1': {}
+{% endif %}
+      ? {{ lookup('template', interfaces_template_path, template_vars={'start_index': 33}) }}
+      : router:
+          adaptive-routing:
+            enable: on
+    qos:
+      roce:
+        enable: on
+        mode: lossless
+      traffic-pool:
+        default-lossy:
+          memory-percent: 10
+        roce-lossless:
+          memory-percent: 90
+    router:
+      adaptive-routing:
+        enable: on
+        profile: profile-custom
+{% if prescriptive_topology_manager %}
+      ptm:
+        enable: on
+{% endif %}
+      bgp:
+        autonomous-system: {{ node_info["asn"] }}
+        enable: on
+        graceful-restart:
+          mode: full
+          restart-time: 180
+          path-selection-deferral-time: 180
+          stale-routes-time: 180
+        router-id: {{ node_info["loopback_ip"] }}
+      policy:
+        prefix-list:
+          hgx_subnets:
+            rule:
+              '10':
+                action: permit
+                match:
+{% if ip_version == "ipv4" %}
+{% if topology == "3-tier" %}
+                  {{ host_first_octet }}.0.0.0/8:
+{% else %}
+                  {{ host_first_octet }}.16.0.0/12:
+{% endif %}
+                    max-prefix-len: 31
+            type: ipv4
+{% else %}
+                  fd02::/16:
+                    max-prefix-len: 64
+            type: ipv6
+{% endif %}
+        route-map:
+          hgx_subnets_and_lo:
+            rule:
+              '10':
+                action:
+                  permit: {}
+                description: permit_hgx_subnets
+                match:
+                  ip-prefix-list: hgx_subnets
+                  type: {{ ip_version }}
+              '20':
+                action:
+                  permit: {}
+                description: permit_lo_ip
+                match:
+                  interface: lo
+                  type: {{ ip_version }}
+          w_ecmp_origin:
+            rule:
+              '10':
+                action:
+                  permit: {}
+                description: enable_w_ecmp_origination
+                set:
+                  ext-community-bw: multipaths
+{% if ip_version == "ipv6" %}
+          set_ipv6_gua:
+            rule:
+              '10':
+                action:
+                  permit: {}
+                description: enabe_set_ipv6_gua
+                set:
+                  ipv6-nexthop-prefer-global: on
+{% endif %}
+    vrf:
+      default:
+        router:
+          bgp:
+            address-family:
+{% if ip_version == "ipv6" %}
+              ipv4-unicast:
+                enable: off
+{% endif %}
+              {{ ip_version }}-unicast:
+                aggregate-route:
+{% for rail_subnet in node_info["rail_subnets"] %}
+                   {{ rail_subnet }}:
+                    summary-only: on
+{% endfor %}
+                enable: on
+                redistribute:
+                  connected:
+                    enable: on
+                    route-map: hgx_subnets_and_lo
+                advertise-origin: {}
+                nhg-per-origin: {}
+                multipaths:
+                  ebgp: 128
+            enable: on
+{% set already_inserted_title = namespace(value=false) %}
+{% for port in node_info["ports"] %}
+{% if node_info["ports"][port]["peer_role"] != "host" %}
+{%  if not already_inserted_title.value %}
+            neighbor:
+{%   set already_inserted_title.value = true %}
+{%  endif %}
+              {{ node_info["ports"][port]["peer_ip_address"] }}:
+                description: to_{{ node_info["ports"][port]["peer_node"] }}_{{ node_info["ports"][port]["peer_port"] }}
+                peer-group: underlay_spine
+                type: numbered
+{% endif %}
+{% endfor %}
+            path-selection:
+              multipath:
+                aspath-ignore: on
+            peer-group:
+              underlay_spine:
+                address-family:
+                  ipv4-unicast:
+{% if ip_version == "ipv4" %}
+                    policy:
+                      outbound:
+                        route-map: w_ecmp_origin
+{% else %}
+                    enable: off
+                  ipv6-unicast:
+                    enable: on
+                    policy:
+                      inbound:
+                        route-map: set_ipv6_gua
+                      outbound:
+                        route-map: w_ecmp_origin
+{% endif %}
+                bfd:
+                  detect-multiplier: 3
+                  enable: on
+                  min-rx-interval: 300
+                  min-tx-interval: 300
+                description: underlay_switch_interconnect_to_spine
+                remote-as: external
