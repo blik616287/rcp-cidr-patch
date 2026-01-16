@@ -145,7 +145,7 @@ pod_num: 1
 pod_size: 1
 topology: "2-tier-poc"
 system_type: "h100"
-hca_type: "BlueField-3"
+hca_type: "ConnectX-7"
 host_interfaces: ["eth1", "eth2", "eth3", "eth4"]
 
 # Required parameters
@@ -279,22 +279,136 @@ Host 3: 172.16.0.24/29
   - Available for pods: .26-.31 (6 IPs)
 ```
 
-## Step 12: Run RCP Configuration
+## Step 12: Run RCP Configuration (Switch-Only Mode)
+
+This workflow configures switches without requiring hosts to be online. This is useful for pre-staging network configuration.
 
 ```bash
 # Generate recommended topology
 sudo docker exec spectrum-x-rcp rcp-tool topology recommended
 
-# Prepare hosts
-sudo docker exec spectrum-x-rcp rcp-tool host prepare
+# Verify the IP scheme shows correct subnet size
+sudo docker exec spectrum-x-rcp rcp-tool host show --ip_scheme
+```
 
-# Prepare switches
+**Expected Output (with /29 subnet):**
+```
++--------------+------+----------------+------+
+| host         | port | ip address     | rail |
++--------------+------+----------------+------+
+| hgx-su00-h00 | eth1 | 172.16.0.0/29  | 0    |
+| hgx-su00-h00 | eth2 | 172.18.0.0/29  | 1    |
+| hgx-su00-h01 | eth1 | 172.16.0.8/29  | 0    |
+| hgx-su00-h01 | eth2 | 172.18.0.8/29  | 1    |
+...
+```
+
+```bash
+# Generate netplan configs (saved to host/out/<hostname>.yaml)
+sudo docker exec spectrum-x-rcp rcp-tool host configure --generate
+
+# Configure switches
 sudo docker exec spectrum-x-rcp rcp-tool switch prepare
+sudo docker exec spectrum-x-rcp rcp-tool switch configure
 
-# Discover topology
+# Copy netplan files to topology/out for access outside container
+sudo docker exec spectrum-x-rcp cp -r /root/spectrum-x-rcp/host/out/. /root/spectrum-x-rcp/topology/out/
+```
+
+## Step 13: Generate Kubernetes CIDRPool YAMLs
+
+Exit the RCP container context and generate NV-IPAM CIDRPool YAMLs from the netplan configs.
+
+### Install Dependencies
+
+```bash
+# Install jq and yq (Mike Farah version)
+sudo apt install -y jq
+sudo snap install yq
+```
+
+### Run Conversion Script
+
+```bash
+# Set up directories
+mkdir -p host/netplan host/cidrpool
+
+# Copy netplan files from container output
+sudo chown ubuntu:ubuntu ~/spectrum-x-rcp/topology/out/*.yaml
+mv ~/spectrum-x-rcp/topology/out/hgx-*.yaml host/netplan/
+
+# Run the conversion script (auto-detects subnet prefix)
+chmod +x ~/rcp-cidr-patch/generate_rail_cidrpools.sh
+~/rcp-cidr-patch/generate_rail_cidrpools.sh -i host/netplan -o host/cidrpool
+```
+
+**Expected Output:**
+```
+Auto-detected subnet prefix: /29
+Wrote /home/ubuntu/host/cidrpool/rail-1-cidrpool.yaml
+Wrote /home/ubuntu/host/cidrpool/rail-2-cidrpool.yaml
+Wrote /home/ubuntu/host/cidrpool/rail-3-cidrpool.yaml
+Wrote /home/ubuntu/host/cidrpool/rail-4-cidrpool.yaml
+CIDRPool generation complete.
+```
+
+### View Generated CIDRPool YAMLs
+
+```bash
+cd host/cidrpool
+for i in $(ls *-cidrpool.yaml); do echo "---" && cat $i; done
+```
+
+**Example Output (rail-1):**
+```yaml
+apiVersion: nv-ipam.nvidia.com/v1alpha1
+kind: CIDRPool
+metadata:
+  name: rail-1
+  namespace: nvidia-network-operator
+spec:
+  cidr: 172.16.0.0/15
+  gatewayIndex: 0
+  perNodeNetworkPrefix: 29
+  routes:
+    - dst: 172.16.0.0/15
+    - dst: 172.16.0.0/12
+  staticAllocations:
+    - gateway: 172.16.0.1
+      nodeName: hgx-su00-h00
+      prefix: 172.16.0.0/29
+    - gateway: 172.16.0.9
+      nodeName: hgx-su00-h01
+      prefix: 172.16.0.8/29
+    - gateway: 172.16.0.17
+      nodeName: hgx-su00-h02
+      prefix: 172.16.0.16/29
+    - gateway: 172.16.0.25
+      nodeName: hgx-su00-h03
+      prefix: 172.16.0.24/29
+```
+
+## Step 14: Apply CIDRPools to Kubernetes (Optional)
+
+If you have a Kubernetes cluster with NV-IPAM installed:
+
+```bash
+kubectl apply -f host/cidrpool/
+```
+
+## Alternative: Full Configuration with Hosts Online
+
+If hosts are online and you want full end-to-end configuration:
+
+```bash
+# Clean any existing configuration
+sudo docker exec spectrum-x-rcp rcp-tool all clean
+
+# Full configuration workflow
+sudo docker exec spectrum-x-rcp rcp-tool topology recommended
+sudo docker exec spectrum-x-rcp rcp-tool host prepare
+sudo docker exec spectrum-x-rcp rcp-tool switch prepare
 sudo docker exec spectrum-x-rcp rcp-tool topology discover --mode full
-
-# Configure all
 sudo docker exec spectrum-x-rcp rcp-tool all configure
 
 # Validate
@@ -385,7 +499,27 @@ gust --delete <SIM_ID>
 ## Related Files
 
 - `rcp-cidr-patch/README.md` - Detailed patch documentation
+- `rcp-cidr-patch/VALIDATION.md` - Test procedures and validation guide
 - `rcp-cidr-patch/patches/ipv4am.py` - Modified IP allocator
 - `rcp-cidr-patch/patches/system_config.py` - Modified config validator
 - `rcp-cidr-patch/sample-config.yaml` - Sample configuration
 - `rcp-cidr-patch/apply-cidr-patch.sh` - Patch installation script
+- `rcp-cidr-patch/generate_rail_cidrpools.sh` - Netplan to CIDRPool converter
+
+## Changelog
+
+### v1.1.0 (2026-01-16)
+- **Changed**: `hca_type` in config examples from `BlueField-3` to `ConnectX-7`
+- **Changed**: Step 12 rewritten as "Switch-Only Mode" workflow (hosts not required)
+- **Added**: Step 13 - Generate Kubernetes CIDRPool YAMLs using conversion script
+- **Added**: Step 14 - Apply CIDRPools to Kubernetes
+- **Added**: Alternative section for full configuration with hosts online
+- **Added**: Expected output examples for IP scheme and CIDRPool generation
+- **Added**: `generate_rail_cidrpools.sh` to Related Files
+
+### v1.0.0 (2026-01-15)
+- Initial deployment guide
+- NVIDIA AIR simulation setup steps
+- RCP container installation
+- CIDR patch application
+- IP allocation verification

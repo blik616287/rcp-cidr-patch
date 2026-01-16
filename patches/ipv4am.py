@@ -115,10 +115,15 @@ class IPv4AM(IPAM):
             # This works for all subnet sizes: host=.0, switch=.1, extra=.2+
             port_ip_address = cls.modify_last_octet(peer_port_ip_address, 1)
             port.ip_address = port_ip_address
+            # MODIFIED: Leaf port connected to host uses configurable subnet size
+            subnet_size, _ = cls._get_subnet_config()
+            port.subnet = str(subnet_size)
 
         elif peer_role == "spine":
             port_ip_address = cls.modify_last_octet(peer_port_ip_address, -1)
             port.ip_address = port_ip_address
+            # Leaf-to-spine connections remain /31
+            port.subnet = "31"
 
     @classmethod
     def set_spine_ip(cls, port: Port, ip_index: int) -> None:
@@ -127,6 +132,8 @@ class IPv4AM(IPAM):
 
         if peer_role == "leaf":
             port.ip_address = cls.LEVEL_2_IP_FORMAT.format(port.node.index_in_pod, ip_index + 1)
+            # Spine-to-leaf connections use /31
+            port.subnet = "31"
 
         elif peer_role == "super_spine":
             peer_port_ip_address = port.peer_port.ip_address
@@ -135,6 +142,8 @@ class IPv4AM(IPAM):
                 raise RuntimeError(err_msg)
             port_ip_address = cls.modify_last_octet(peer_port_ip_address, -1)
             port.ip_address = port_ip_address
+            # Spine-to-super_spine connections use /31
+            port.subnet = "31"
 
     @classmethod
     def set_leaf_rail_subnets(cls, leaf: Leaf) -> None:
@@ -236,6 +245,8 @@ class IPv4AM3TierTopology(IPv4AM):
             fourth_octet = ip_start_index + 1
 
         port.ip_address = cls.LEVEL_3_IP_FORMAT.format(second_octet, third_octet, fourth_octet)
+        # Super-spine connections use /31
+        port.subnet = "31"
 
     @classmethod
     def set_leaf_rail_subnets(cls, leaf: Leaf) -> None:

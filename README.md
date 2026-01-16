@@ -74,6 +74,23 @@ port.subnet = str(subnet_size)
 - Updated `validate_config()` to call new verification
 - Updated `update_config()` to set default subnet size
 
+### 3. `spcx_core/nodes_info_builder.py`
+
+**Location in container:** `/usr/local/lib/python3.12/dist-packages/spcx_core/nodes_info_builder.py`
+
+**Changes:**
+- Added `subnet` field to leaf port info for host connections
+- This exposes the configurable subnet value to Jinja2 templates
+
+### 4. `spcx_core/switch/cumulus/none/leaf_yaml.j2`
+
+**Location in container:** `/usr/local/lib/python3.12/dist-packages/spcx_core/switch/cumulus/none/leaf_yaml.j2`
+
+**Changes:**
+- Modified IPv4 address rendering to use dynamic subnet for host connections
+- Host-facing ports use configurable subnet (`/29`, `/30`, or `/31`)
+- Spine-facing ports remain fixed at `/31`
+
 ## Installation
 
 ### Prerequisites
@@ -101,6 +118,8 @@ chmod +x apply-cidr-patch.sh
 # Copy patched files into the container
 docker cp patches/ipv4am.py spectrum-x-rcp:/usr/local/lib/python3.12/dist-packages/spcx_core/configurator/ipv4am.py
 docker cp patches/system_config.py spectrum-x-rcp:/usr/local/lib/python3.12/dist-packages/spcx_core/config/system_config.py
+docker cp patches/nodes_info_builder.py spectrum-x-rcp:/usr/local/lib/python3.12/dist-packages/spcx_core/nodes_info_builder.py
+docker cp patches/leaf_yaml.j2 spectrum-x-rcp:/usr/local/lib/python3.12/dist-packages/spcx_core/switch/cumulus/none/leaf_yaml.j2
 ```
 
 ### Verify Installation
@@ -126,7 +145,7 @@ pod_num: 1
 pod_size: 1
 topology: "2-tier-poc"
 system_type: "h100"
-hca_type: "BlueField-3"
+hca_type: "ConnectX-7"
 host_interfaces: ["eth1", "eth2", "eth3", "eth4"]
 
 # NEW: Configurable subnet size (29, 30, or 31)
@@ -168,20 +187,55 @@ Rail 0 (eth1):
   Host 3: 172.16.0.24/29 (switch: .25, extra: .26-.31)
 ```
 
-## Re-applying Configuration
+## RCP Configuration Workflow
 
-After modifying `config.yaml`, re-run the RCP configuration:
+The patched RCP can configure switches without requiring hosts to be online. This is useful for pre-staging network configuration.
+
+### Step 1: Generate Topology and IP Scheme
+
+```bash
+# Generate recommended topology
+docker exec spectrum-x-rcp rcp-tool topology recommended
+
+# Verify IP scheme (should show /29 or configured subnet)
+docker exec spectrum-x-rcp rcp-tool host show --ip_scheme
+```
+
+### Step 2: Generate Host Netplan Configs
+
+```bash
+# Generate netplan configs (saved to host/out/<hostname>.yaml)
+docker exec spectrum-x-rcp rcp-tool host configure --generate
+```
+
+### Step 3: Configure Switches
+
+```bash
+# Prepare and configure switches
+docker exec spectrum-x-rcp rcp-tool switch prepare
+docker exec spectrum-x-rcp rcp-tool switch configure
+```
+
+### Step 4: Export Netplan Files
+
+```bash
+# Copy netplan files to topology/out for access outside container
+docker exec spectrum-x-rcp cp -r /root/spectrum-x-rcp/host/out/. /root/spectrum-x-rcp/topology/out/
+```
+
+### Re-applying Configuration
+
+After modifying `config.yaml`, clean and re-run:
 
 ```bash
 # Clean existing configuration
 docker exec spectrum-x-rcp rcp-tool all clean
 
 # Re-apply with new subnet size
-docker exec spectrum-x-rcp rcp-tool all configure
-
-# Validate
-docker exec spectrum-x-rcp rcp-tool validation host-config
-docker exec spectrum-x-rcp rcp-tool validation ping
+docker exec spectrum-x-rcp rcp-tool topology recommended
+docker exec spectrum-x-rcp rcp-tool host configure --generate
+docker exec spectrum-x-rcp rcp-tool switch prepare
+docker exec spectrum-x-rcp rcp-tool switch configure
 ```
 
 ## Kubernetes Integration
@@ -194,10 +248,71 @@ With larger subnets, you can configure:
 apiVersion: nv-ipam.nvidia.com/v1alpha1
 kind: CIDRPool
 metadata:
-  name: rail0-pool
+  name: rail-1
+  namespace: nvidia-network-operator
 spec:
-  cidr: "172.16.0.0/16"
-  perNodeBlockSize: 4  # For /30, use 4. For /29, use 8.
+  cidr: 172.16.0.0/15
+  gatewayIndex: 0
+  perNodeNetworkPrefix: 31
+  routes:
+    - dst: 172.16.0.0/15
+    - dst: 172.16.0.0/12
+  staticAllocations:
+    - gateway: 172.16.0.1
+      nodeName: hgx-su00-h00
+      prefix: 172.16.0.0/31
+    - gateway: 172.16.0.3
+      nodeName: hgx-su00-h01
+      prefix: 172.16.0.2/31
+    - gateway: 172.16.0.5
+      nodeName: hgx-su00-h02
+      prefix: 172.16.0.4/31
+    - gateway: 172.16.0.7
+      nodeName: hgx-su00-h03
+      prefix: 172.16.0.6/31
+```
+
+Note: Use `perNodeNetworkPrefix` (not `perNodeBlockSize`) and `staticAllocations` to ensure the correct IPs are assigned to each host.
+
+### Generating CIDRPool YAMLs from Netplan
+
+The included `generate_rail_cidrpools.sh` script converts RCP-generated netplan configs into NV-IPAM CIDRPool YAMLs.
+
+**Prerequisites:**
+```bash
+# Install jq and yq (Mike Farah version)
+sudo apt install -y jq
+sudo snap install yq
+```
+
+**Usage:**
+```bash
+# Exit the RCP container first, then set up directories
+mkdir -p host/netplan host/cidrpool
+
+# Copy netplan files from container output
+sudo chown $USER:$USER spectrum-x-rcp/topology/out/*.yaml
+mv spectrum-x-rcp/topology/out/hgx-*.yaml host/netplan/
+
+# Run the conversion script
+chmod +x generate_rail_cidrpools.sh
+./generate_rail_cidrpools.sh -i host/netplan -o host/cidrpool
+```
+
+**Options:**
+```bash
+./generate_rail_cidrpools.sh -i <input_dir> -o <output_dir> [-n <namespace>] [-p <subnet_prefix>]
+
+  -i  Input directory containing netplan YAML files
+  -o  Output directory for CIDRPool YAMLs
+  -n  Kubernetes namespace (default: nvidia-network-operator)
+  -p  Subnet prefix (29, 30, or 31). Auto-detected from netplan if not specified.
+```
+
+**View Generated YAMLs:**
+```bash
+cd host/cidrpool
+for i in $(ls *-cidrpool.yaml); do echo "---" && cat $i; done
 ```
 
 ### MacvlanNetworks
@@ -265,14 +380,16 @@ docker exec spectrum-x-rcp rcp-tool all configure
 ```
 rcp-cidr-patch/
 ├── README.md                    # This documentation
+├── DEPLOYMENT-GUIDE.md          # Step-by-step NVIDIA AIR deployment
+├── VALIDATION.md                # Test procedures and validation guide
 ├── apply-cidr-patch.sh          # Installation script
+├── generate_rail_cidrpools.sh   # Netplan to CIDRPool converter
 ├── sample-config.yaml           # Example configuration
 ├── patches/
 │   ├── ipv4am.py               # Modified IP allocator
-│   └── system_config.py        # Modified config validator
-└── backups/                     # Created during installation
-    ├── ipv4am.py.orig          # Original IP allocator
-    └── system_config.py.orig   # Original config validator
+│   ├── system_config.py        # Modified config validator
+│   ├── nodes_info_builder.py   # Modified node info builder (for template data)
+│   └── leaf_yaml.j2            # Modified leaf switch Jinja2 template
 ```
 
 ## Version Compatibility
@@ -281,6 +398,33 @@ rcp-cidr-patch/
 - **Docker Image:** `gitlab-master.nvidia.com:5005/cloud-orchestration/spectrum-x-rcp:V2.0.0-GA.1`
 - **Python Version:** 3.12
 - **spcx_core Location:** `/usr/local/lib/python3.12/dist-packages/spcx_core/`
+
+## Changelog
+
+### v1.2.0 (2026-01-16)
+- **Added**: `nodes_info_builder.py` patch to expose subnet value to Jinja2 templates
+- **Added**: `leaf_yaml.j2` patch to use dynamic subnet for host-facing switch ports
+- **Fixed**: Switch config YAML files now correctly show `/29` (or configured subnet) for host connections
+- **Fixed**: Leaf-to-spine connections remain fixed at `/31` in switch config YAML
+- **Validated**: Full end-to-end validation on NVIDIA AIR simulation
+
+### v1.1.0 (2026-01-16)
+- **Changed**: `hca_type` in examples from `BlueField-3` to `ConnectX-7`
+- **Added**: `generate_rail_cidrpools.sh` script for converting netplan to CIDRPool YAMLs
+- **Added**: RCP Configuration Workflow section with switch-only mode (no hosts required)
+- **Added**: Generating CIDRPool YAMLs from Netplan section
+- **Fixed**: Switch configs now use correct subnet sizes in `ipv4am.py`:
+  - Host-to-leaf connections: configurable (`/29`, `/30`, `/31`)
+  - Leaf-to-spine connections: fixed `/31`
+  - Spine connections: fixed `/31`
+- **Updated**: NV-IPAM CIDRPools example to use `perNodeNetworkPrefix` and `staticAllocations`
+
+### v1.0.0 (2026-01-15)
+- Initial release
+- Added `host_subnet_size` configuration parameter (29, 30, 31)
+- Modified `ipv4am.py` for configurable subnet sizing
+- Modified `system_config.py` for parameter validation
+- Created `apply-cidr-patch.sh` installation script
 
 ## License
 

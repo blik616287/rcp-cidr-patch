@@ -27,6 +27,8 @@ BACKUP_DIR="${SCRIPT_DIR}/backups"
 SPCX_CORE_PATH="/usr/local/lib/python3.12/dist-packages/spcx_core"
 IPAM_PATH="${SPCX_CORE_PATH}/configurator/ipv4am.py"
 CONFIG_PATH="${SPCX_CORE_PATH}/config/system_config.py"
+NODES_INFO_PATH="${SPCX_CORE_PATH}/nodes_info_builder.py"
+LEAF_TEMPLATE_PATH="${SPCX_CORE_PATH}/switch/cumulus/none/leaf_yaml.j2"
 
 # Colors for output
 RED='\033[0;31m'
@@ -105,6 +107,16 @@ backup_files() {
         print_warn "Could not backup system_config.py - file may not exist"
     }
 
+    # Backup nodes_info_builder.py
+    docker cp "${CONTAINER_NAME}:${NODES_INFO_PATH}" "${BACKUP_DIR}/nodes_info_builder.py.orig" 2>/dev/null || {
+        print_warn "Could not backup nodes_info_builder.py - file may not exist"
+    }
+
+    # Backup leaf_yaml.j2
+    docker cp "${CONTAINER_NAME}:${LEAF_TEMPLATE_PATH}" "${BACKUP_DIR}/leaf_yaml.j2.orig" 2>/dev/null || {
+        print_warn "Could not backup leaf_yaml.j2 - file may not exist"
+    }
+
     print_info "Backups saved to: ${BACKUP_DIR}"
 }
 
@@ -122,6 +134,16 @@ apply_patch() {
         exit 1
     fi
 
+    if [[ ! -f "${PATCHES_DIR}/nodes_info_builder.py" ]]; then
+        print_error "Patch file not found: ${PATCHES_DIR}/nodes_info_builder.py"
+        exit 1
+    fi
+
+    if [[ ! -f "${PATCHES_DIR}/leaf_yaml.j2" ]]; then
+        print_error "Patch file not found: ${PATCHES_DIR}/leaf_yaml.j2"
+        exit 1
+    fi
+
     # Copy patched ipv4am.py
     print_info "Patching ipv4am.py..."
     docker cp "${PATCHES_DIR}/ipv4am.py" "${CONTAINER_NAME}:${IPAM_PATH}"
@@ -129,6 +151,14 @@ apply_patch() {
     # Copy patched system_config.py
     print_info "Patching system_config.py..."
     docker cp "${PATCHES_DIR}/system_config.py" "${CONTAINER_NAME}:${CONFIG_PATH}"
+
+    # Copy patched nodes_info_builder.py
+    print_info "Patching nodes_info_builder.py..."
+    docker cp "${PATCHES_DIR}/nodes_info_builder.py" "${CONTAINER_NAME}:${NODES_INFO_PATH}"
+
+    # Copy patched leaf_yaml.j2
+    print_info "Patching leaf_yaml.j2..."
+    docker cp "${PATCHES_DIR}/leaf_yaml.j2" "${CONTAINER_NAME}:${LEAF_TEMPLATE_PATH}"
 
     print_info "Patch applied successfully!"
 }
@@ -160,6 +190,22 @@ verify_patch() {
         return 1
     fi
 
+    # Check if nodes_info_builder.py contains the subnet field for leaf ports
+    if docker exec "${CONTAINER_NAME}" grep -q '"subnet".*leaf_port.subnet' "${NODES_INFO_PATH}" 2>/dev/null; then
+        print_info "nodes_info_builder.py: PATCHED"
+    else
+        print_error "nodes_info_builder.py: NOT PATCHED or file missing"
+        return 1
+    fi
+
+    # Check if leaf_yaml.j2 contains dynamic subnet logic
+    if docker exec "${CONTAINER_NAME}" grep -q 'port_info\["subnet"\]' "${LEAF_TEMPLATE_PATH}" 2>/dev/null; then
+        print_info "leaf_yaml.j2: PATCHED"
+    else
+        print_error "leaf_yaml.j2: NOT PATCHED or file missing"
+        return 1
+    fi
+
     print_info "Patch verification: SUCCESS"
     return 0
 }
@@ -187,6 +233,22 @@ rollback() {
         print_info "Restored: system_config.py"
     else
         print_warn "Original system_config.py backup not found"
+    fi
+
+    # Restore nodes_info_builder.py
+    if [[ -f "${BACKUP_DIR}/nodes_info_builder.py.orig" ]]; then
+        docker cp "${BACKUP_DIR}/nodes_info_builder.py.orig" "${CONTAINER_NAME}:${NODES_INFO_PATH}"
+        print_info "Restored: nodes_info_builder.py"
+    else
+        print_warn "Original nodes_info_builder.py backup not found"
+    fi
+
+    # Restore leaf_yaml.j2
+    if [[ -f "${BACKUP_DIR}/leaf_yaml.j2.orig" ]]; then
+        docker cp "${BACKUP_DIR}/leaf_yaml.j2.orig" "${CONTAINER_NAME}:${LEAF_TEMPLATE_PATH}"
+        print_info "Restored: leaf_yaml.j2"
+    else
+        print_warn "Original leaf_yaml.j2 backup not found"
     fi
 
     print_info "Rollback complete!"

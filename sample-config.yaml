@@ -16,7 +16,7 @@ topology: "2-tier-poc"
 
 # System and HCA type
 system_type: "h100"
-hca_type: "BlueField-3"
+hca_type: "ConnectX-7"
 
 # Host network interfaces
 host_interfaces: ["eth1", "eth2", "eth3", "eth4"]
