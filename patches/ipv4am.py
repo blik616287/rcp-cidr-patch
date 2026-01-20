@@ -54,20 +54,22 @@ class IPv4AM(IPAM):
         Calculate the fourth octet for a host IP address.
 
         For each subnet block:
-        - /31: 2 addresses (0=host, 1=switch)
-        - /30: 4 addresses (0=network, 1=host, 2=switch, 3=broadcast)
-               But we use: 0=host_base, 1=switch, 2-3=extra host IPs
-        - /29: 8 addresses (0=host_base, 1=switch, 2-7=extra host IPs)
+        - /31: 2 addresses (0=host, 1=switch) - point-to-point, both usable
+        - /30: 4 addresses (0=network, 1=switch, 2=host, 3=broadcast)
+        - /29: 8 addresses (0=network, 1=switch, 2=host, 3-6=extra, 7=broadcast)
 
         Args:
             index_in_su: The host's index within the SU (0, 1, 2, ...)
             addresses_per_block: Number of addresses per subnet block
 
         Returns:
-            The fourth octet value for the host's base IP
+            The fourth octet value for the host's IP
         """
-        # Each host gets a block of addresses; host base IP is at start of block
-        return index_in_su * addresses_per_block
+        base = index_in_su * addresses_per_block
+        if addresses_per_block == 2:  # /31 point-to-point
+            return base  # host at .0, switch at .1
+        else:  # /30, /29: network at .0, switch at .1, host at .2
+            return base + 2
 
     @classmethod
     def set_host_ip(cls, port: Port) -> None:
@@ -111,12 +113,16 @@ class IPv4AM(IPAM):
         peer_role = port.peer_port.node.role
 
         if peer_role == "host":
-            # MODIFIED: Switch gets IP at offset 1 within the host's subnet block
-            # This works for all subnet sizes: host=.0, switch=.1, extra=.2+
-            port_ip_address = cls.modify_last_octet(peer_port_ip_address, 1)
+            # MODIFIED: Calculate switch IP based on subnet size
+            # For /31: host=.0, switch=.1 (add 1)
+            # For /30, /29: network=.0, switch=.1, host=.2 (subtract 1 from host)
+            subnet_size, addresses_per_block = cls._get_subnet_config()
+            if addresses_per_block == 2:  # /31 point-to-point
+                port_ip_address = cls.modify_last_octet(peer_port_ip_address, 1)
+            else:  # /30, /29: switch is at host - 1
+                port_ip_address = cls.modify_last_octet(peer_port_ip_address, -1)
             port.ip_address = port_ip_address
             # MODIFIED: Leaf port connected to host uses configurable subnet size
-            subnet_size, _ = cls._get_subnet_config()
             port.subnet = str(subnet_size)
 
         elif peer_role == "spine":

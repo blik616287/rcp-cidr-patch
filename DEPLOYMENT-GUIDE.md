@@ -4,13 +4,41 @@ This guide documents the complete process of deploying NVIDIA Spectrum-X RCP wit
 
 ## Overview
 
-This deployment enables configurable subnet sizes (`/29`, `/30`, `/31`) for host IP allocation, allowing multiple IP addresses per host for Kubernetes pod networking.
+The NVIDIA RCP tool originally generates `/31` subnets for host IP allocation, providing only **1 usable IP per NIC per node**. This patch enables configurable subnet sizes (`/29`, `/30`, `/31`) to support multi-pod-per-node Kubernetes deployments.
+
+### Use Cases
+
+| Subnet | IPs/Block | Usable | Use Case |
+|--------|-----------|--------|----------|
+| `/31` | 2 | 1 host | Original design |
+| `/30` | 4 | 3 (1 host + 2 pods) | 2 GPUs, 1 pod/GPU |
+| `/29` | 8 | 7 (1 host + 6 pods) | 4+ GPUs, 1 pod/GPU |
+
+## Quick Start (Automated)
+
+For automated deployment on an NVIDIA AIR simulation, use the deployment script:
+
+```bash
+# Copy patch files to oob-mgmt-server
+scp -r rcp-cidr-patch ubuntu@oob-mgmt-server:~/
+
+# SSH to server and run
+ssh ubuntu@oob-mgmt-server
+cd ~/rcp-cidr-patch
+./deploy-and-validate.sh -s 30   # Use /30 subnets
+```
+
+Options:
+- `-s 29|30|31` - Subnet size (default: 30)
+- `--validate-only` - Only run validation tests
+- `--skip-docker` - Skip Docker installation
 
 ## Prerequisites
 
 - NVIDIA AIR account with API token
 - `gust` CLI tool configured with credentials
 - SSH key management via GitHub
+- RCP tar file: `spectrum-x-rcp-V2.0.0-GA.tar`
 
 ## Step 1: Delete Existing Simulation (if any)
 
@@ -170,6 +198,8 @@ EOF
 
 ### inventory/hosts
 
+**IMPORTANT:** The `[switch:children]` section is required for Ansible to properly group switches.
+
 ```bash
 cat > ~/spectrum-x-rcp/inventory/hosts << 'EOF'
 [host:vars]
@@ -191,16 +221,16 @@ spine-s00
 
 [super_spine]
 
+[switch:children]
+leaf
+spine
+super_spine
+
 [host]
 hgx-su00-h00
 hgx-su00-h01
 hgx-su00-h02
 hgx-su00-h03
-
-[switch:children]
-super_spine
-spine
-leaf
 
 [disabled]
 hgx-su00-h[04:31]
@@ -224,252 +254,325 @@ sudo docker run -itd --network host \
 
 ## Step 10: Apply CIDR Patch
 
+**IMPORTANT:** All 4 patch files must be applied, plus symlinks for missing scripts.
+
+### 10.1 Copy Patch Files
+
 ```bash
-# Copy patched files into container
+# Copy ALL 4 patched files into container
 sudo docker cp ~/rcp-cidr-patch/patches/ipv4am.py \
   spectrum-x-rcp:/usr/local/lib/python3.12/dist-packages/spcx_core/configurator/ipv4am.py
 
 sudo docker cp ~/rcp-cidr-patch/patches/system_config.py \
   spectrum-x-rcp:/usr/local/lib/python3.12/dist-packages/spcx_core/config/system_config.py
 
-# Verify patch
-sudo docker exec spectrum-x-rcp grep -c 'host_subnet_size' \
+sudo docker cp ~/rcp-cidr-patch/patches/nodes_info_builder.py \
+  spectrum-x-rcp:/usr/local/lib/python3.12/dist-packages/spcx_core/nodes_info_builder.py
+
+sudo docker cp ~/rcp-cidr-patch/patches/leaf_yaml.j2 \
+  spectrum-x-rcp:/usr/local/lib/python3.12/dist-packages/spcx_core/switch/cumulus/none/leaf_yaml.j2
+```
+
+### 10.2 Netplan Script Symlinks (Automatic)
+
+**Note:** The `apply-cidr-patch.sh` script now automatically creates the required netplan symlinks. If you applied the patch using the script, you can skip to Step 10.3.
+
+**Manual creation (if needed):** RCP V2.0.0-GA is missing netplan scripts. Create symlinks:
+
+```bash
+HOST_DIR="/usr/local/lib/python3.12/dist-packages/spcx_core/host"
+
+sudo docker exec spectrum-x-rcp ln -sf \
+  ${HOST_DIR}/linux_spectrum-x.sh \
+  ${HOST_DIR}/netplan_spectrum-x.sh
+
+sudo docker exec spectrum-x-rcp ln -sf \
+  ${HOST_DIR}/linux_networkd_spectrum-x.sh \
+  ${HOST_DIR}/netplan_networkd_spectrum-x.sh
+```
+
+### 10.3 Clean Cached Configs
+
+```bash
+# CRITICAL: Clean any cached configs from previous runs
+sudo docker exec spectrum-x-rcp rcp-tool all clean
+```
+
+### 10.4 Verify Patch Installation
+
+```bash
+# Verify ipv4am.py (should output: 4)
+sudo docker exec spectrum-x-rcp grep -c '_get_subnet_config' \
   /usr/local/lib/python3.12/dist-packages/spcx_core/configurator/ipv4am.py
-# Should output: 2
 
-sudo docker exec spectrum-x-rcp grep -c '_set_host_subnet_size' \
-  /usr/local/lib/python3.12/dist-packages/spcx_core/config/system_config.py
-# Should output: 2
+# Verify IP offset fix (CRITICAL - must show "return base + 2")
+sudo docker exec spectrum-x-rcp grep "return base + 2" \
+  /usr/local/lib/python3.12/dist-packages/spcx_core/configurator/ipv4am.py
+
+# Verify nodes_info_builder.py getattr fix
+sudo docker exec spectrum-x-rcp grep 'getattr.*subnet' \
+  /usr/local/lib/python3.12/dist-packages/spcx_core/nodes_info_builder.py
+
+# Verify leaf_yaml.j2 dynamic subnet
+sudo docker exec spectrum-x-rcp grep 'port_info\["subnet"\]' \
+  /usr/local/lib/python3.12/dist-packages/spcx_core/switch/cumulus/none/leaf_yaml.j2
 ```
 
-## Step 11: Verify IP Allocation
+**Or use the install script (recommended):**
+```bash
+cd ~/rcp-cidr-patch
+sudo ./apply-cidr-patch.sh
+```
+
+## Step 11: Discover Topology and Create Custom Topology File
+
+**CRITICAL FOR NVIDIA AIR:** The AIR simulation has a specific physical topology that may differ from RCP's recommended topology. You must create a topology file that matches the actual wiring.
+
+### Port Format Requirements
+
+**IMPORTANT:** Port names must use breakout notation matching your `leaf_downlinks_breakout` config:
+- If `leaf_downlinks_breakout: 2`, use `swp1s0`, `swp1s1` (not `swp1`)
+- If `leaf_downlinks_breakout: 1`, use `swp1` (no suffix)
+
+### Run Topology Discovery (Optional)
 
 ```bash
-sudo docker exec spectrum-x-rcp python3 -c '
-from spcx_core.config_manager import ConfigManager
-from spcx_core.configurator.ipv4am import IPv4AM
-config = ConfigManager()
-print("host_subnet_size:", config.get("host_subnet_size"))
-subnet_size, addresses_per_block = IPv4AM._get_subnet_config()
-print("addresses_per_block:", addresses_per_block)
-for i in range(4):
-    fourth = i * addresses_per_block
-    print(f"Host {i}: 172.16.0.{fourth}/{subnet_size}")
-    print(f"  - Switch IP: 172.16.0.{fourth+1}")
-    print(f"  - Available for pods: .{fourth+2}-.{fourth+7} (6 IPs)")
-'
+sudo docker exec spectrum-x-rcp rcp-tool topology discover
 ```
 
-**Expected Output:**
-```
-host_subnet_size: 29
-addresses_per_block: 8
+**NOTE:** LLDP discovery in AIR often shows hosts as "ubuntu" instead of hostnames. You may need to map MAC addresses to hostnames manually.
 
-Host 0: 172.16.0.0/29
-  - Switch IP: 172.16.0.1
-  - Available for pods: .2-.7 (6 IPs)
-Host 1: 172.16.0.8/29
-  - Switch IP: 172.16.0.9
-  - Available for pods: .10-.15 (6 IPs)
-Host 2: 172.16.0.16/29
-  - Switch IP: 172.16.0.17
-  - Available for pods: .18-.23 (6 IPs)
-Host 3: 172.16.0.24/29
-  - Switch IP: 172.16.0.25
-  - Available for pods: .26-.31 (6 IPs)
-```
+### Create Custom Topology File
 
-## Step 12: Run RCP Configuration (Switch-Only Mode)
-
-This workflow configures switches without requiring hosts to be online. This is useful for pre-staging network configuration.
+Create a topology file that matches the actual AIR wiring:
 
 ```bash
-# Generate recommended topology
-sudo docker exec spectrum-x-rcp rcp-tool topology recommended
+cat > ~/spectrum-x-rcp/config/config_network.dot << 'EOF'
+graph "network" {
+"oob-mgmt-server" [function="oob-server" os="oob-mgmt-server" memory="16048" cpu="16"]
+"leaf-su00-r0" [os="cumulus-vx-5.13.0.0023" cpu="2" memory="4096" model="SN5600" role="leaf"]
+"leaf-su00-r1" [os="cumulus-vx-5.13.0.0023" cpu="2" memory="4096" model="SN5600" role="leaf"]
+"spine-s00" [os="cumulus-vx-5.13.0.0023" cpu="2" memory="4096" model="SN5600" role="spine"]
+"hgx-su00-h00" [os="generic/ubuntu2204" role="host"]
+"hgx-su00-h01" [os="generic/ubuntu2204" role="host"]
+"hgx-su00-h02" [os="generic/ubuntu2204" role="host"]
+"hgx-su00-h03" [os="generic/ubuntu2204" role="host"]
 
-# Verify the IP scheme shows correct subnet size
-sudo docker exec spectrum-x-rcp rcp-tool host show --ip_scheme
+"hgx-su00-h00":"eth1"--"leaf-su00-r0":"swp1s0"
+"hgx-su00-h01":"eth1"--"leaf-su00-r0":"swp2s0"
+"hgx-su00-h02":"eth1"--"leaf-su00-r0":"swp3s0"
+"hgx-su00-h03":"eth1"--"leaf-su00-r0":"swp4s0"
+
+"hgx-su00-h00":"eth2"--"leaf-su00-r1":"swp1s0"
+"hgx-su00-h01":"eth2"--"leaf-su00-r1":"swp2s0"
+"hgx-su00-h02":"eth2"--"leaf-su00-r1":"swp3s0"
+"hgx-su00-h03":"eth2"--"leaf-su00-r1":"swp4s0"
+
+"leaf-su00-r0":"swp5s0"--"spine-s00":"swp1s0"
+"leaf-su00-r1":"swp5s0"--"spine-s00":"swp2s0"
+}
+EOF
 ```
 
-**Expected Output (with /29 subnet):**
+**Also copy to topology/out directory:**
+```bash
+sudo docker exec spectrum-x-rcp cp /root/spectrum-x-rcp/config/config_network.dot \
+  /root/spectrum-x-rcp/topology/out/config_network.dot
 ```
-+--------------+------+----------------+------+
-| host         | port | ip address     | rail |
-+--------------+------+----------------+------+
-| hgx-su00-h00 | eth1 | 172.16.0.0/29  | 0    |
-| hgx-su00-h00 | eth2 | 172.18.0.0/29  | 1    |
-| hgx-su00-h01 | eth1 | 172.16.0.8/29  | 0    |
-| hgx-su00-h01 | eth2 | 172.18.0.8/29  | 1    |
+
+### Rail Assignment Logic
+
+**CRITICAL:** Preserve correct rail assignment with `leaf_rails: 2`:
+- **leaf-su00-r0** handles rail 0 (eth1, eth3 from ALL hosts)
+- **leaf-su00-r1** handles rail 1 (eth2, eth4 from ALL hosts)
+
+Each leaf must connect to **ALL 4 hosts**, not a subset. Incorrect assignment breaks connectivity.
+
+Verify rail assignment:
+```bash
+# Should show connections to all 4 hosts (h00-h03)
+sudo docker exec spectrum-x-rcp cat /root/spectrum-x-rcp/switch/out/leaf-su00-r0.yaml | \
+  grep -E "to_hgx-su00-h0[0-3]" | sort -u
+```
+
+## Step 12: Generate and Apply Configurations
+
+### Run Full Configuration
+
+```bash
+# Generate and apply all configs (switches and hosts)
+sudo docker exec spectrum-x-rcp rcp-tool all configure
+```
+
+This will:
+1. Generate switch YAML configs
+2. Apply configs to switches (leafs will reboot)
+3. Generate host netplan configs
+4. Apply netplan to hosts
+
+**Note:** You may see `networkd-dispatcher timeout` errors on hosts in simulation - this is expected without real NVIDIA hardware and does not affect network functionality.
+
+### Verify Switch Configs
+
+```bash
+# Check switch configs have correct subnet (should show /29, not /31)
+sudo docker exec spectrum-x-rcp cat /root/spectrum-x-rcp/switch/out/leaf-su00-r0.yaml | grep -E "172\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+"
+```
+
+**Expected:** Shows `/29` for host-facing ports, `/31` for spine-facing ports.
+
+### Verify Host IPs
+
+```bash
+# Check hosts got correct IPs
+for host in hgx-su00-h00 hgx-su00-h01 hgx-su00-h02 hgx-su00-h03; do
+    echo "=== $host ==="
+    sshpass -p "nvidia" ssh -o StrictHostKeyChecking=no ubuntu@$host \
+        "ip -4 addr show eth1 | grep inet; ip -4 addr show eth2 | grep inet" 2>/dev/null
+done
+```
+
+**Expected IP Layout (/29):**
+| Host | eth1 | eth2 |
+|------|------|------|
+| h00 | 172.16.0.2/29 | 172.18.0.2/29 |
+| h01 | 172.16.0.10/29 | 172.18.0.10/29 |
+| h02 | 172.16.0.18/29 | 172.18.0.18/29 |
+| h03 | 172.16.0.26/29 | 172.18.0.26/29 |
+
+**Key:** Host IPs are at `.2` position (not `.0` network address)
+
+## Step 13: Validate Configuration
+
+### Gateway Ping Test
+
+Test that all hosts can ping their switch gateways:
+
+```bash
+for host in hgx-su00-h00 hgx-su00-h01 hgx-su00-h02 hgx-su00-h03; do
+    echo "--- $host ---"
+    sshpass -p "nvidia" ssh -o StrictHostKeyChecking=no ubuntu@$host '
+        for eth in eth1 eth2; do
+            ip=$(ip -4 addr show $eth 2>/dev/null | grep -oP "(?<=inet )\d+\.\d+\.\d+\.\d+")
+            # Gateway is always at .1 in the subnet
+            gw=$(echo $ip | sed "s/\.[0-9]*$/.1/")
+            if [ -n "$ip" ]; then
+                ping -c 1 -W 2 $gw -I $eth >/dev/null 2>&1 && echo "$eth: $ip -> $gw OK" || echo "$eth: $ip -> $gw FAIL"
+            fi
+        done
+    ' 2>/dev/null
+done
+```
+
+**Expected output (all 8 tests pass):**
+```
+--- hgx-su00-h00 ---
+eth1: 172.16.0.2 -> 172.16.0.1 OK
+eth2: 172.18.0.2 -> 172.18.0.1 OK
+--- hgx-su00-h01 ---
+eth1: 172.16.0.10 -> 172.16.0.9 OK
+eth2: 172.18.0.10 -> 172.18.0.9 OK
 ...
 ```
 
-```bash
-# Generate netplan configs (saved to host/out/<hostname>.yaml)
-sudo docker exec spectrum-x-rcp rcp-tool host configure --generate
+### Cross-Host Ping Test
 
-# Configure switches
-sudo docker exec spectrum-x-rcp rcp-tool switch prepare
-sudo docker exec spectrum-x-rcp rcp-tool switch configure
-
-# Copy netplan files to topology/out for access outside container
-sudo docker exec spectrum-x-rcp cp -r /root/spectrum-x-rcp/host/out/. /root/spectrum-x-rcp/topology/out/
-```
-
-## Step 13: Generate Kubernetes CIDRPool YAMLs
-
-Exit the RCP container context and generate NV-IPAM CIDRPool YAMLs from the netplan configs.
-
-### Install Dependencies
+Test connectivity between hosts through the spine:
 
 ```bash
-# Install jq and yq (Mike Farah version)
-sudo apt install -y jq
-sudo snap install yq
+echo "h00 -> h01, h02, h03"
+sshpass -p "nvidia" ssh -o StrictHostKeyChecking=no ubuntu@hgx-su00-h00 '
+    for target in 172.16.0.10 172.16.0.18 172.16.0.26; do
+        ping -c 1 -W 2 $target -I eth1 >/dev/null 2>&1 && echo "-> $target OK" || echo "-> $target FAIL"
+    done
+' 2>/dev/null
 ```
 
-### Run Conversion Script
-
-```bash
-# Set up directories
-mkdir -p host/netplan host/cidrpool
-
-# Copy netplan files from container output
-sudo chown ubuntu:ubuntu ~/spectrum-x-rcp/topology/out/*.yaml
-mv ~/spectrum-x-rcp/topology/out/hgx-*.yaml host/netplan/
-
-# Run the conversion script (auto-detects subnet prefix)
-chmod +x ~/rcp-cidr-patch/generate_rail_cidrpools.sh
-~/rcp-cidr-patch/generate_rail_cidrpools.sh -i host/netplan -o host/cidrpool
-```
-
-**Expected Output:**
-```
-Auto-detected subnet prefix: /29
-Wrote /home/ubuntu/host/cidrpool/rail-1-cidrpool.yaml
-Wrote /home/ubuntu/host/cidrpool/rail-2-cidrpool.yaml
-Wrote /home/ubuntu/host/cidrpool/rail-3-cidrpool.yaml
-Wrote /home/ubuntu/host/cidrpool/rail-4-cidrpool.yaml
-CIDRPool generation complete.
-```
-
-### View Generated CIDRPool YAMLs
-
-```bash
-cd host/cidrpool
-for i in $(ls *-cidrpool.yaml); do echo "---" && cat $i; done
-```
-
-**Example Output (rail-1):**
-```yaml
-apiVersion: nv-ipam.nvidia.com/v1alpha1
-kind: CIDRPool
-metadata:
-  name: rail-1
-  namespace: nvidia-network-operator
-spec:
-  cidr: 172.16.0.0/15
-  gatewayIndex: 0
-  perNodeNetworkPrefix: 29
-  routes:
-    - dst: 172.16.0.0/15
-    - dst: 172.16.0.0/12
-  staticAllocations:
-    - gateway: 172.16.0.1
-      nodeName: hgx-su00-h00
-      prefix: 172.16.0.0/29
-    - gateway: 172.16.0.9
-      nodeName: hgx-su00-h01
-      prefix: 172.16.0.8/29
-    - gateway: 172.16.0.17
-      nodeName: hgx-su00-h02
-      prefix: 172.16.0.16/29
-    - gateway: 172.16.0.25
-      nodeName: hgx-su00-h03
-      prefix: 172.16.0.24/29
-```
-
-## Step 14: Apply CIDRPools to Kubernetes (Optional)
-
-If you have a Kubernetes cluster with NV-IPAM installed:
-
-```bash
-kubectl apply -f host/cidrpool/
-```
-
-## Alternative: Full Configuration with Hosts Online
-
-If hosts are online and you want full end-to-end configuration:
-
-```bash
-# Clean any existing configuration
-sudo docker exec spectrum-x-rcp rcp-tool all clean
-
-# Full configuration workflow
-sudo docker exec spectrum-x-rcp rcp-tool topology recommended
-sudo docker exec spectrum-x-rcp rcp-tool host prepare
-sudo docker exec spectrum-x-rcp rcp-tool switch prepare
-sudo docker exec spectrum-x-rcp rcp-tool topology discover --mode full
-sudo docker exec spectrum-x-rcp rcp-tool all configure
-
-# Validate
-sudo docker exec spectrum-x-rcp rcp-tool validation switch-config
-sudo docker exec spectrum-x-rcp rcp-tool validation host-config
-sudo docker exec spectrum-x-rcp rcp-tool validation ping
-```
+**Expected:** All cross-host pings succeed (TTL=63 indicates routing through spine).
 
 ## IP Allocation Summary
 
-| Subnet Size | Addresses/Block | Host IPs | Switch IP | Extra for Pods |
-|-------------|-----------------|----------|-----------|----------------|
-| `/31` (default) | 2 | 1 | 1 | 0 |
-| `/30` | 4 | 1 | 1 | 2 |
-| `/29` | 8 | 1 | 1 | 6 |
+| Subnet Size | Addresses/Block | Network | Switch/GW | Host | Broadcast | Extra for Pods |
+|-------------|-----------------|---------|-----------|------|-----------|----------------|
+| `/31` (default) | 2 | N/A | .1 | .0 | N/A | 0 |
+| `/30` | 4 | .0 | .1 | .2 | .3 | 0 |
+| `/29` | 8 | .0 | .1 | .2 | .7 | 5 (.3-.6) |
 
 ### /29 IP Layout (per host, per rail)
 
 ```
 Host 0, Rail 0: 172.16.0.0/29
-  ├── 172.16.0.0 - Host base IP
-  ├── 172.16.0.1 - Switch IP
-  ├── 172.16.0.2 - Pod IP 1
-  ├── 172.16.0.3 - Pod IP 2
-  ├── 172.16.0.4 - Pod IP 3
-  ├── 172.16.0.5 - Pod IP 4
-  ├── 172.16.0.6 - Pod IP 5
-  └── 172.16.0.7 - Pod IP 6
+  ├── 172.16.0.0 - Network address (unusable)
+  ├── 172.16.0.1 - Switch/Gateway IP
+  ├── 172.16.0.2 - Host IP
+  ├── 172.16.0.3 - Pod IP 1
+  ├── 172.16.0.4 - Pod IP 2
+  ├── 172.16.0.5 - Pod IP 3
+  ├── 172.16.0.6 - Pod IP 4
+  └── 172.16.0.7 - Broadcast (unusable)
 
 Host 1, Rail 0: 172.16.0.8/29
-  ├── 172.16.0.8 - Host base IP
-  ├── 172.16.0.9 - Switch IP
-  └── 172.16.0.10-15 - Pod IPs (6 available)
+  ├── 172.16.0.8  - Network address (unusable)
+  ├── 172.16.0.9  - Switch/Gateway IP
+  ├── 172.16.0.10 - Host IP
+  └── 172.16.0.11-14 - Pod IPs (4 available)
 
-... and so on for each host and rail
+Host 2, Rail 0: 172.16.0.16/29
+  ├── 172.16.0.16 - Network address (unusable)
+  ├── 172.16.0.17 - Switch/Gateway IP
+  ├── 172.16.0.18 - Host IP
+  └── 172.16.0.19-22 - Pod IPs (4 available)
+
+Host 3, Rail 0: 172.16.0.24/29
+  ├── 172.16.0.24 - Network address (unusable)
+  ├── 172.16.0.25 - Switch/Gateway IP
+  ├── 172.16.0.26 - Host IP
+  └── 172.16.0.27-30 - Pod IPs (4 available)
 ```
 
 ## Files Modified by Patch
 
 | File | Location | Changes |
 |------|----------|---------|
-| `ipv4am.py` | `spcx_core/configurator/` | Added `_get_subnet_config()`, `_calculate_host_fourth_octet()`, configurable subnet in `set_host_ip()` |
+| `ipv4am.py` | `spcx_core/configurator/` | Added `_get_subnet_config()`, `_calculate_host_fourth_octet()` with correct offset for /29 and /30, fixed `set_leaf_ip()` to calculate switch IP correctly |
 | `system_config.py` | `spcx_core/config/` | Added `host_subnet_size` validation and defaults |
+| `nodes_info_builder.py` | `spcx_core/` | Added `getattr()` for subnet field to handle missing attribute gracefully |
+| `leaf_yaml.j2` | `spcx_core/switch/cumulus/none/` | Uses dynamic subnet for host-facing ports (spine ports remain /31) |
+
+**All 4 files are required.** Missing any file will result in incorrect configs or errors.
 
 ## Troubleshooting
 
 ### Connection Refused
 Wait 30-60 seconds after starting simulation for SSH to become available.
 
-### Missing Config Parameters
-Ensure all required parameters are in `config.yaml`. Check RCP logs:
-```bash
-sudo docker logs spectrum-x-rcp
+### Hosts Not In Inventory
+Ensure the `[host]` section in `inventory/hosts` includes all hosts and the `[switch:children]` section exists.
+
+### Switch Configure Skipping Hosts
+Ensure `[switch:children]` is defined in inventory file:
+```ini
+[switch:children]
+leaf
+spine
+super_spine
 ```
 
-### Patch Not Applied
-Verify patch with:
+### Gateway Pings Failing
+1. Verify the custom topology file matches actual physical connections
+2. Check switch configs were applied: `nv config show` on switch
+3. Verify host netplan was applied: `ip addr show eth1` on host
+
+### Host IP Shows .0 Instead of .2
+The patch file `ipv4am.py` is incorrect or not applied. Verify:
 ```bash
-sudo docker exec spectrum-x-rcp grep "host_subnet_size" \
+sudo docker exec spectrum-x-rcp grep -A5 "_calculate_host_fourth_octet" \
   /usr/local/lib/python3.12/dist-packages/spcx_core/configurator/ipv4am.py
 ```
+Should show `return base + 2` for the non-/31 case.
+
+### LLDP Shows "ubuntu" Instead of Hostnames
+This is expected in AIR. Map MAC addresses to hostnames manually to create the custom topology file.
 
 ## Quick Reference Commands
 
@@ -502,24 +605,42 @@ gust --delete <SIM_ID>
 - `rcp-cidr-patch/VALIDATION.md` - Test procedures and validation guide
 - `rcp-cidr-patch/patches/ipv4am.py` - Modified IP allocator
 - `rcp-cidr-patch/patches/system_config.py` - Modified config validator
+- `rcp-cidr-patch/patches/nodes_info_builder.py` - Modified nodes info builder
+- `rcp-cidr-patch/patches/leaf_yaml.j2` - Modified leaf switch template
 - `rcp-cidr-patch/sample-config.yaml` - Sample configuration
 - `rcp-cidr-patch/apply-cidr-patch.sh` - Patch installation script
-- `rcp-cidr-patch/generate_rail_cidrpools.sh` - Netplan to CIDRPool converter
+- `rcp-cidr-patch/deploy-and-validate.sh` - Full automated deployment script
 
 ## Changelog
 
+### v2.1.0 (2026-01-20)
+- **NEW**: `deploy-and-validate.sh` - Full end-to-end automated deployment script
+- **FIXED**: Switch config output path corrected (`/switch/out/` not `/output/switch/`)
+- **UPDATED**: Quick Start section added with automated deployment instructions
+
+### v2.0.0 (2026-01-20)
+- **CRITICAL FIX**: Fixed `ipv4am.py` host IP offset calculation
+  - Host IPs now correctly at `.2` (not `.0` network address) for /29 and /30
+  - Switch IPs at `.1` for all subnet sizes
+- **NEW**: `apply-cidr-patch.sh` now automatically creates netplan symlinks
+- **NEW**: Port format requirements documented (swp1s0 breakout notation)
+- **UPDATED**: Step 10.2 - Netplan symlinks now automatic with manual fallback
+- **UPDATED**: Step 11 - Simplified topology file creation
+- **UPDATED**: Step 12 - Simplified to `rcp-tool all configure`
+- **UPDATED**: Step 13 - Working validation tests from actual deployment
+- **UPDATED**: Rail assignment verification added
+- **FIXED**: All 4 patch files documented with verification steps
+- **TESTED**: Full end-to-end deployment validated on AIR simulation
+
+### v1.2.0 (2026-01-19)
+- Added custom topology file requirement for NVIDIA AIR
+- Added MAC address mapping instructions
+- Updated IP Allocation Summary
+
 ### v1.1.0 (2026-01-16)
-- **Changed**: `hca_type` in config examples from `BlueField-3` to `ConnectX-7`
-- **Changed**: Step 12 rewritten as "Switch-Only Mode" workflow (hosts not required)
-- **Added**: Step 13 - Generate Kubernetes CIDRPool YAMLs using conversion script
-- **Added**: Step 14 - Apply CIDRPools to Kubernetes
-- **Added**: Alternative section for full configuration with hosts online
-- **Added**: Expected output examples for IP scheme and CIDRPool generation
-- **Added**: `generate_rail_cidrpools.sh` to Related Files
+- Changed `hca_type` to `ConnectX-7`
+- Added CIDRPool generation workflow
+- Added `generate_rail_cidrpools.sh`
 
 ### v1.0.0 (2026-01-15)
 - Initial deployment guide
-- NVIDIA AIR simulation setup steps
-- RCP container installation
-- CIDR patch application
-- IP allocation verification

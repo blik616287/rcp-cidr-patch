@@ -29,6 +29,7 @@ IPAM_PATH="${SPCX_CORE_PATH}/configurator/ipv4am.py"
 CONFIG_PATH="${SPCX_CORE_PATH}/config/system_config.py"
 NODES_INFO_PATH="${SPCX_CORE_PATH}/nodes_info_builder.py"
 LEAF_TEMPLATE_PATH="${SPCX_CORE_PATH}/switch/cumulus/none/leaf_yaml.j2"
+HOST_DIR="${SPCX_CORE_PATH}/host"
 
 # Colors for output
 RED='\033[0;31m'
@@ -160,6 +161,21 @@ apply_patch() {
     print_info "Patching leaf_yaml.j2..."
     docker cp "${PATCHES_DIR}/leaf_yaml.j2" "${CONTAINER_NAME}:${LEAF_TEMPLATE_PATH}"
 
+    # Create netplan symlinks for Ubuntu hosts
+    # RCP looks for netplan_spectrum-x.sh and netplan_networkd_spectrum-x.sh which don't exist
+    # We create symlinks to the equivalent linux scripts
+    print_info "Creating netplan symlinks..."
+    docker exec "${CONTAINER_NAME}" ln -sf \
+        "${HOST_DIR}/linux_spectrum-x.sh" \
+        "${HOST_DIR}/netplan_spectrum-x.sh" 2>/dev/null || {
+        print_warn "Could not create netplan_spectrum-x.sh symlink"
+    }
+    docker exec "${CONTAINER_NAME}" ln -sf \
+        "${HOST_DIR}/linux_networkd_spectrum-x.sh" \
+        "${HOST_DIR}/netplan_networkd_spectrum-x.sh" 2>/dev/null || {
+        print_warn "Could not create netplan_networkd_spectrum-x.sh symlink"
+    }
+
     print_info "Patch applied successfully!"
 }
 
@@ -190,9 +206,17 @@ verify_patch() {
         return 1
     fi
 
-    # Check if nodes_info_builder.py contains the subnet field for leaf ports
-    if docker exec "${CONTAINER_NAME}" grep -q '"subnet".*leaf_port.subnet' "${NODES_INFO_PATH}" 2>/dev/null; then
-        print_info "nodes_info_builder.py: PATCHED"
+    # Check for correct host IP offset calculation (critical fix)
+    if docker exec "${CONTAINER_NAME}" grep -q "return base + 2" "${IPAM_PATH}" 2>/dev/null; then
+        print_info "Host IP offset calculation: CORRECT (base + 2 for /29, /30)"
+    else
+        print_error "Host IP offset calculation: INCORRECT - hosts will get network address!"
+        return 1
+    fi
+
+    # Check if nodes_info_builder.py contains the getattr fix for subnet field
+    if docker exec "${CONTAINER_NAME}" grep -q 'getattr.*subnet' "${NODES_INFO_PATH}" 2>/dev/null; then
+        print_info "nodes_info_builder.py: PATCHED (getattr fix present)"
     else
         print_error "nodes_info_builder.py: NOT PATCHED or file missing"
         return 1
@@ -204,6 +228,19 @@ verify_patch() {
     else
         print_error "leaf_yaml.j2: NOT PATCHED or file missing"
         return 1
+    fi
+
+    # Check if netplan symlinks exist
+    if docker exec "${CONTAINER_NAME}" test -L "${HOST_DIR}/netplan_spectrum-x.sh" 2>/dev/null; then
+        print_info "netplan_spectrum-x.sh symlink: PRESENT"
+    else
+        print_warn "netplan_spectrum-x.sh symlink: MISSING (may cause issues with Ubuntu hosts)"
+    fi
+
+    if docker exec "${CONTAINER_NAME}" test -L "${HOST_DIR}/netplan_networkd_spectrum-x.sh" 2>/dev/null; then
+        print_info "netplan_networkd_spectrum-x.sh symlink: PRESENT"
+    else
+        print_warn "netplan_networkd_spectrum-x.sh symlink: MISSING (may cause issues with Ubuntu hosts)"
     fi
 
     print_info "Patch verification: SUCCESS"

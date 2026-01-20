@@ -90,7 +90,7 @@ class NodesInfoBuilder:
                         nodes_info[leaf_name]["ports"][leaf_port_name]["su"] = host.su_index
                         nodes_info[leaf_name]["ports"][leaf_port_name]["pod"] = pod_index
                         nodes_info[leaf_name]["ports"][leaf_port_name]["plane"] = leaf_port.plane_index
-                        nodes_info[leaf_name]["ports"][leaf_port_name]["subnet"] = leaf_port.subnet
+                        nodes_info[leaf_name]["ports"][leaf_port_name]["subnet"] = getattr(leaf_port, 'subnet', '31')
 
         for spine_name, spine in topology.spines.items():
             pod_index = spine.pod_index if spine.pod_index is not None else "XX"
