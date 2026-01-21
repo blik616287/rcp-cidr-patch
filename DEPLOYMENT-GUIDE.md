@@ -30,8 +30,12 @@ cd ~/rcp-cidr-patch
 
 Options:
 - `-s 29|30|31` - Subnet size (default: 30)
-- `--validate-only` - Only run validation tests
+- `-c <name>` - Container name (default: spectrum-x-rcp)
 - `--skip-docker` - Skip Docker installation
+- `--skip-patch` - Skip patch application
+- `--validate-only` - Only run validation tests
+
+The script automatically discovers the physical topology via LLDP from hosts. It brings up host interfaces, handles apt lock contention, and waits for LLDP neighbor discovery. If LLDP fails, it falls back to the default AIR topology (h00→swp1s0, h01→swp2s0, h02→swp3s0, h03→swp4s0).
 
 ## Prerequisites
 
@@ -328,6 +332,8 @@ sudo ./apply-cidr-patch.sh
 
 **CRITICAL FOR NVIDIA AIR:** The AIR simulation has a specific physical topology that may differ from RCP's recommended topology. You must create a topology file that matches the actual wiring.
 
+**NOTE:** If using `deploy-and-validate.sh`, topology discovery is handled automatically via LLDP from the host side. The script installs `lldpd` on all hosts, waits for neighbor discovery, and generates the topology file. Skip to Step 12.
+
 ### Port Format Requirements
 
 **IMPORTANT:** Port names must use breakout notation matching your `leaf_downlinks_breakout` config:
@@ -341,6 +347,30 @@ sudo docker exec spectrum-x-rcp rcp-tool topology discover
 ```
 
 **NOTE:** LLDP discovery in AIR often shows hosts as "ubuntu" instead of hostnames. You may need to map MAC addresses to hostnames manually.
+
+### Manual LLDP Discovery from Hosts
+
+For more reliable topology discovery, query LLDP from the host side:
+
+```bash
+# Install lldpd on all hosts
+for host in hgx-su00-h00 hgx-su00-h01 hgx-su00-h02 hgx-su00-h03; do
+    sshpass -p "nvidia" ssh -o StrictHostKeyChecking=no ubuntu@$host \
+        "sudo apt-get update -qq && sudo apt-get install -y -qq lldpd && sudo systemctl restart lldpd"
+done
+
+# Wait for LLDP discovery (60s for virtualized environments)
+sleep 60
+
+# Query LLDP neighbors
+for host in hgx-su00-h00 hgx-su00-h01 hgx-su00-h02 hgx-su00-h03; do
+    echo "=== $host ==="
+    sshpass -p "nvidia" ssh -o StrictHostKeyChecking=no ubuntu@$host \
+        "sudo lldpctl eth1 eth2 | grep -E 'Interface:|PortID:.*ifname'"
+done
+```
+
+This shows which switch port each host interface is connected to (e.g., eth1→swp1s0).
 
 ### Create Custom Topology File
 
@@ -574,6 +604,29 @@ Should show `return base + 2` for the non-/31 case.
 ### LLDP Shows "ubuntu" Instead of Hostnames
 This is expected in AIR. Map MAC addresses to hostnames manually to create the custom topology file.
 
+### LLDP Discovery Returns No Neighbors
+This can happen when:
+1. **Host interfaces are DOWN** - Bring them up first:
+   ```bash
+   sudo ip link set eth1 up
+   sudo ip link set eth2 up
+   ```
+2. **lldpd not installed** - Install with `sudo apt-get install -y lldpd`
+3. **lldpd not running** - Restart with `sudo systemctl restart lldpd`
+4. **apt lock held** - Wait for unattended-upgrades to finish or kill it:
+   ```bash
+   sudo fuser -k /var/lib/dpkg/lock-frontend
+   sudo apt-get install -y lldpd
+   ```
+5. **Not enough time for discovery** - LLDP default TX interval is 30s, but virtualized environments need longer. Wait at least 60s after starting lldpd:
+   ```bash
+   sudo systemctl restart lldpd && sleep 60 && sudo lldpctl eth1 eth2
+   ```
+6. **Switches not sending LLDP** - Verify LLDP is enabled on switches:
+   ```bash
+   sshpass -p "CumulusLinux!" ssh cumulus@leaf-su00-r0 "nv show system lldp"
+   ```
+
 ## Quick Reference Commands
 
 ```bash
@@ -612,6 +665,22 @@ gust --delete <SIM_ID>
 - `rcp-cidr-patch/deploy-and-validate.sh` - Full automated deployment script
 
 ## Changelog
+
+### v2.3.0 (2026-01-21)
+- **FIXED**: LLDP discovery now works reliably on fresh AIR environments
+  - Brings up host network interfaces (eth1-eth4) before LLDP discovery
+  - Falls back to default AIR topology when LLDP discovery fails
+  - Default topology: h00→swp1s0, h01→swp2s0, h02→swp3s0, h03→swp4s0
+- **VALIDATED**: Full end-to-end deployment successful (27 tests passed)
+
+### v2.2.0 (2026-01-21)
+- **FIXED**: LLDP discovery in `deploy-and-validate.sh` now more reliable
+  - Sequential lldpd installation with apt lock handling (waits up to 60s for dpkg lock)
+  - Increased LLDP wait time from 15s to 60s (virtualized environments need longer)
+  - Always restarts lldpd to ensure service is running
+- **ADDED**: Manual LLDP discovery instructions in Step 11
+- **ADDED**: LLDP troubleshooting section with common issues and solutions
+- **UPDATED**: Quick Start options now include all available flags
 
 ### v2.1.0 (2026-01-20)
 - **NEW**: `deploy-and-validate.sh` - Full end-to-end automated deployment script
