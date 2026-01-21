@@ -187,7 +187,7 @@ install_docker() {
     print_step "Installing Docker..."
 
     sudo apt-get update -qq
-    sudo apt-get install -y -qq ca-certificates curl gnupg lsb-release
+    sudo apt-get install -y -qq ca-certificates curl gnupg lsb-release wget sshpass
 
     sudo mkdir -p /etc/apt/keyrings
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg 2>/dev/null
@@ -221,24 +221,68 @@ load_rcp_image() {
 
     if [[ -z "$IMAGE_TAG" ]]; then
         # No image found, need to load from tar
-        RCP_TAR=$(find /home -name "spectrum-x-rcp*.tar" -o -name "*spectrum*rcp*.tar" 2>/dev/null | head -1)
+        # Find tar file that is at least 100MB (valid RCP image is ~800MB)
+        RCP_TAR=$(find /home -name "spectrum-x-rcp*.tar" -size +100M 2>/dev/null | head -1)
 
         if [[ -z "$RCP_TAR" ]]; then
-            print_error "RCP tar file not found. Please copy it to the server first."
-            exit 1
+            # Clean up any corrupt/empty tar files from failed downloads
+            find /home -name "spectrum-x-rcp*.tar" -size -100M -delete 2>/dev/null || true
+            # Tar not found, download it
+            print_info "RCP tar file not found, downloading..."
+            RCP_TAR="/home/ubuntu/spectrum-x-rcp-V2.0.0-GA.tar"
+            RCP_TAR_URL="https://kevin-s3-public.s3.eu-west-3.amazonaws.com/rcp/spectrum-x-rcp-V2.0.0-GA.tar"
+
+            # Remove any existing corrupt/empty file
+            rm -f "$RCP_TAR"
+
+            print_info "Downloading from: $RCP_TAR_URL"
+            if ! wget --progress=bar:force -O "$RCP_TAR" "$RCP_TAR_URL" 2>&1; then
+                rm -f "$RCP_TAR"
+                print_error "Failed to download RCP tar from: $RCP_TAR_URL"
+                exit 1
+            fi
+
+            # Verify file was actually downloaded (not empty)
+            if [[ ! -s "$RCP_TAR" ]]; then
+                rm -f "$RCP_TAR"
+                print_error "Downloaded file is empty or missing: $RCP_TAR"
+                exit 1
+            fi
+
+            # Verify it's a valid tar file
+            if ! tar -tf "$RCP_TAR" &>/dev/null; then
+                rm -f "$RCP_TAR"
+                print_error "Downloaded file is not a valid tar archive: $RCP_TAR"
+                exit 1
+            fi
+
+            print_info "Downloaded RCP tar to: $RCP_TAR ($(du -h "$RCP_TAR" | cut -f1))"
         fi
 
         print_step "Loading RCP image from: $RCP_TAR"
-        sudo docker load -i "$RCP_TAR"
+        if ! sudo docker load -i "$RCP_TAR"; then
+            print_error "Failed to load Docker image from: $RCP_TAR"
+            exit 1
+        fi
 
         # Get the loaded image tag
         IMAGE_TAG=$(sudo docker images --format '{{.Repository}}:{{.Tag}}' | grep spectrum-x-rcp | head -1)
+        if [[ -z "$IMAGE_TAG" ]]; then
+            print_error "Docker load succeeded but no spectrum-x-rcp image found!"
+            exit 1
+        fi
     fi
 
     # Tag as latest for easier reference
     if [[ -n "$IMAGE_TAG" && "$IMAGE_TAG" != "spectrum-x-rcp:latest" ]]; then
         print_step "Tagging $IMAGE_TAG as spectrum-x-rcp:latest"
         sudo docker tag "$IMAGE_TAG" spectrum-x-rcp:latest
+    fi
+
+    # Final verification
+    if ! sudo docker images --format '{{.Repository}}:{{.Tag}}' | grep -q "^spectrum-x-rcp:latest$"; then
+        print_error "RCP image spectrum-x-rcp:latest not available after load!"
+        exit 1
     fi
 
     print_info "RCP image ready: spectrum-x-rcp:latest"
@@ -414,71 +458,83 @@ start_container() {
 # =============================================================================
 
 discover_actual_topology() {
-    print_info "Collecting host MAC addresses..."
+    print_info "Discovering topology via LLDP from HOST side..."
 
-    # Collect MAC addresses from each host
-    declare -A HOST_ETH1_MAC
-    declare -A HOST_ETH2_MAC
     local hosts=("hgx-su00-h00" "hgx-su00-h01" "hgx-su00-h02" "hgx-su00-h03")
+    declare -A HOST_ETH1_PORT
+    declare -A HOST_ETH2_PORT
+    local discovered_count=0
 
+    # First, ensure lldpd is installed and running on all hosts
+    print_info "Installing lldpd on hosts (if needed)..."
     for host in "${hosts[@]}"; do
-        local eth1_mac=$(sshpass -p "nvidia" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
-            ubuntu@${host} "ip link show eth1 2>/dev/null | grep 'link/ether' | awk '{print \$2}'" 2>/dev/null)
-        local eth2_mac=$(sshpass -p "nvidia" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
-            ubuntu@${host} "ip link show eth2 2>/dev/null | grep 'link/ether' | awk '{print \$2}'" 2>/dev/null)
+        sshpass -p "nvidia" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+            ubuntu@${host} "which lldpctl &>/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq lldpd && sudo systemctl start lldpd)" 2>/dev/null &
+    done
+    wait
 
-        if [[ -n "$eth1_mac" ]]; then
-            HOST_ETH1_MAC[$host]="$eth1_mac"
-            print_info "  ${host} eth1: ${eth1_mac}"
+    # Give lldpd time to discover neighbors
+    print_info "Waiting 15s for LLDP discovery..."
+    sleep 15
+
+    # Query LLDP from each host to find which switch port it's connected to
+    for host in "${hosts[@]}"; do
+        print_info "Querying LLDP from ${host}..."
+
+        # Get eth1 LLDP neighbor (connected to leaf-su00-r0)
+        local eth1_lldp=$(sshpass -p "nvidia" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+            ubuntu@${host} "sudo lldpctl eth1 2>/dev/null | grep -E 'PortID:.*ifname' | awk '{print \$NF}'" 2>/dev/null | tr -d '\r\n')
+
+        # Get eth2 LLDP neighbor (connected to leaf-su00-r1)
+        local eth2_lldp=$(sshpass -p "nvidia" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+            ubuntu@${host} "sudo lldpctl eth2 2>/dev/null | grep -E 'PortID:.*ifname' | awk '{print \$NF}'" 2>/dev/null | tr -d '\r\n')
+
+        if [[ -n "$eth1_lldp" && "$eth1_lldp" =~ ^swp ]]; then
+            HOST_ETH1_PORT[$host]="$eth1_lldp"
+            print_info "  ${host} eth1 -> leaf-su00-r0:${eth1_lldp}"
+            ((discovered_count++))
+        else
+            print_warn "  ${host} eth1: No LLDP data"
         fi
-        if [[ -n "$eth2_mac" ]]; then
-            HOST_ETH2_MAC[$host]="$eth2_mac"
-            print_info "  ${host} eth2: ${eth2_mac}"
+
+        if [[ -n "$eth2_lldp" && "$eth2_lldp" =~ ^swp ]]; then
+            HOST_ETH2_PORT[$host]="$eth2_lldp"
+            print_info "  ${host} eth2 -> leaf-su00-r1:${eth2_lldp}"
+            ((discovered_count++))
+        else
+            print_warn "  ${host} eth2: No LLDP data"
         fi
     done
 
-    print_info "Collecting switch LLDP neighbor information..."
-
-    # Get LLDP neighbors from leaf switches
-    local leaf0_lldp=$(sudo docker exec "${CONTAINER_NAME}" ansible -i /root/spectrum-x-rcp/inventory/hosts \
-        leaf-su00-r0 -m shell -a "nv show interface --view lldp 2>/dev/null | grep -E 'swp[0-9]+s[0-9]+.*ubuntu'" 2>/dev/null | grep -v "CHANGED" || true)
-    local leaf1_lldp=$(sudo docker exec "${CONTAINER_NAME}" ansible -i /root/spectrum-x-rcp/inventory/hosts \
-        leaf-su00-r1 -m shell -a "nv show interface --view lldp 2>/dev/null | grep -E 'swp[0-9]+s[0-9]+.*ubuntu'" 2>/dev/null | grep -v "CHANGED" || true)
-
-    print_info "Building topology from LLDP discovery..."
-
-    # Parse LLDP output and match MAC addresses to hostnames
-    declare -A LEAF0_PORT_TO_HOST
-    declare -A LEAF1_PORT_TO_HOST
-
-    while IFS= read -r line; do
-        [[ -z "$line" ]] && continue
-        local port=$(echo "$line" | awk '{print $1}')
-        local mac=$(echo "$line" | awk '{print $NF}')
+    # If we didn't get enough LLDP data, wait for LLDP to propagate and retry
+    if [[ $discovered_count -lt 4 ]]; then
+        print_warn "Only discovered ${discovered_count} connections, waiting 60s for LLDP to propagate..."
+        sleep 60
 
         for host in "${hosts[@]}"; do
-            if [[ "${HOST_ETH1_MAC[$host]}" == "$mac" ]]; then
-                LEAF0_PORT_TO_HOST[$port]="${host}:eth1"
-                print_info "  Discovered: leaf-su00-r0:${port} -> ${host}:eth1"
+            if [[ -z "${HOST_ETH1_PORT[$host]}" ]]; then
+                local eth1_lldp=$(sshpass -p "nvidia" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+                    ubuntu@${host} "sudo lldpctl eth1 2>/dev/null | grep -E 'PortID:.*ifname' | awk '{print \$NF}'" 2>/dev/null | tr -d '\r\n')
+                if [[ -n "$eth1_lldp" && "$eth1_lldp" =~ ^swp ]]; then
+                    HOST_ETH1_PORT[$host]="$eth1_lldp"
+                    print_info "  ${host} eth1 -> leaf-su00-r0:${eth1_lldp} (retry)"
+                    ((discovered_count++))
+                fi
+            fi
+            if [[ -z "${HOST_ETH2_PORT[$host]}" ]]; then
+                local eth2_lldp=$(sshpass -p "nvidia" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+                    ubuntu@${host} "sudo lldpctl eth2 2>/dev/null | grep -E 'PortID:.*ifname' | awk '{print \$NF}'" 2>/dev/null | tr -d '\r\n')
+                if [[ -n "$eth2_lldp" && "$eth2_lldp" =~ ^swp ]]; then
+                    HOST_ETH2_PORT[$host]="$eth2_lldp"
+                    print_info "  ${host} eth2 -> leaf-su00-r1:${eth2_lldp} (retry)"
+                    ((discovered_count++))
+                fi
             fi
         done
-    done <<< "$leaf0_lldp"
+    fi
 
-    while IFS= read -r line; do
-        [[ -z "$line" ]] && continue
-        local port=$(echo "$line" | awk '{print $1}')
-        local mac=$(echo "$line" | awk '{print $NF}')
-
-        for host in "${hosts[@]}"; do
-            if [[ "${HOST_ETH2_MAC[$host]}" == "$mac" ]]; then
-                LEAF1_PORT_TO_HOST[$port]="${host}:eth2"
-                print_info "  Discovered: leaf-su00-r1:${port} -> ${host}:eth2"
-            fi
-        done
-    done <<< "$leaf1_lldp"
-
-    # Generate topology file based on discovered connections
-    print_info "Generating topology file from discovered connections..."
+    # Generate topology file
+    print_info "Generating topology file..."
 
     cat > "${RCP_DIR}/config/config_network.dot" << 'HEADER'
 graph "network" {
@@ -493,22 +549,22 @@ graph "network" {
 
 HEADER
 
-    # Add host connections from discovered topology
-    for port in "${!LEAF0_PORT_TO_HOST[@]}"; do
-        local host_iface="${LEAF0_PORT_TO_HOST[$port]}"
-        local host=$(echo "$host_iface" | cut -d: -f1)
-        local iface=$(echo "$host_iface" | cut -d: -f2)
-        echo "\"${host}\":\"${iface}\"--\"leaf-su00-r0\":\"${port}\"" >> "${RCP_DIR}/config/config_network.dot"
+    # Add host connections
+    local leaf0_count=0
+    local leaf1_count=0
+
+    for host in "${hosts[@]}"; do
+        if [[ -n "${HOST_ETH1_PORT[$host]}" ]]; then
+            echo "\"${host}\":\"eth1\"--\"leaf-su00-r0\":\"${HOST_ETH1_PORT[$host]}\"" >> "${RCP_DIR}/config/config_network.dot"
+            ((leaf0_count++))
+        fi
+        if [[ -n "${HOST_ETH2_PORT[$host]}" ]]; then
+            echo "\"${host}\":\"eth2\"--\"leaf-su00-r1\":\"${HOST_ETH2_PORT[$host]}\"" >> "${RCP_DIR}/config/config_network.dot"
+            ((leaf1_count++))
+        fi
     done
 
-    for port in "${!LEAF1_PORT_TO_HOST[@]}"; do
-        local host_iface="${LEAF1_PORT_TO_HOST[$port]}"
-        local host=$(echo "$host_iface" | cut -d: -f1)
-        local iface=$(echo "$host_iface" | cut -d: -f2)
-        echo "\"${host}\":\"${iface}\"--\"leaf-su00-r1\":\"${port}\"" >> "${RCP_DIR}/config/config_network.dot"
-    done
-
-    # Add spine connections (discovered from LLDP between switches)
+    # Add spine connections
     cat >> "${RCP_DIR}/config/config_network.dot" << 'SPINE'
 
 "leaf-su00-r0":"swp33s0"--"spine-s00":"swp1s0"
@@ -518,7 +574,16 @@ HEADER
 }
 SPINE
 
-    print_info "Topology discovery complete"
+    print_info "Topology discovery complete: ${leaf0_count} leaf0 connections, ${leaf1_count} leaf1 connections"
+
+    # Verify we got enough connections
+    if [[ $leaf0_count -lt 4 || $leaf1_count -lt 4 ]]; then
+        print_error "TOPOLOGY DISCOVERY FAILED - not enough host connections found!"
+        print_error "Expected 4 connections per leaf, got: leaf0=${leaf0_count}, leaf1=${leaf1_count}"
+        print_error "Generated topology:"
+        cat "${RCP_DIR}/config/config_network.dot"
+        return 1
+    fi
 }
 
 # =============================================================================
@@ -527,6 +592,9 @@ SPINE
 
 apply_patch() {
     print_header "Step 8: Applying CIDR Patch"
+
+    print_info "PATCHES_DIR: ${PATCHES_DIR}"
+    print_info "SPCX_CORE_PATH: ${SPCX_CORE_PATH}"
 
     # Check if patch files exist
     if [[ ! -d "${PATCHES_DIR}" ]]; then
@@ -540,17 +608,38 @@ apply_patch() {
             print_error "Patch file not found: ${PATCHES_DIR}/${file}"
             exit 1
         fi
+        print_info "Found patch file: ${file}"
     done
 
-    print_step "Copying patched files..."
-    sudo docker cp "${PATCHES_DIR}/ipv4am.py" \
-        "${CONTAINER_NAME}:${SPCX_CORE_PATH}/configurator/ipv4am.py"
-    sudo docker cp "${PATCHES_DIR}/system_config.py" \
-        "${CONTAINER_NAME}:${SPCX_CORE_PATH}/config/system_config.py"
-    sudo docker cp "${PATCHES_DIR}/nodes_info_builder.py" \
-        "${CONTAINER_NAME}:${SPCX_CORE_PATH}/nodes_info_builder.py"
-    sudo docker cp "${PATCHES_DIR}/leaf_yaml.j2" \
-        "${CONTAINER_NAME}:${SPCX_CORE_PATH}/switch/cumulus/none/leaf_yaml.j2"
+    print_step "Copying patched files to container..."
+
+    if ! sudo docker cp "${PATCHES_DIR}/ipv4am.py" \
+        "${CONTAINER_NAME}:${SPCX_CORE_PATH}/configurator/ipv4am.py"; then
+        print_error "Failed to copy ipv4am.py"
+        exit 1
+    fi
+    print_info "Copied ipv4am.py"
+
+    if ! sudo docker cp "${PATCHES_DIR}/system_config.py" \
+        "${CONTAINER_NAME}:${SPCX_CORE_PATH}/config/system_config.py"; then
+        print_error "Failed to copy system_config.py"
+        exit 1
+    fi
+    print_info "Copied system_config.py"
+
+    if ! sudo docker cp "${PATCHES_DIR}/nodes_info_builder.py" \
+        "${CONTAINER_NAME}:${SPCX_CORE_PATH}/nodes_info_builder.py"; then
+        print_error "Failed to copy nodes_info_builder.py"
+        exit 1
+    fi
+    print_info "Copied nodes_info_builder.py"
+
+    if ! sudo docker cp "${PATCHES_DIR}/leaf_yaml.j2" \
+        "${CONTAINER_NAME}:${SPCX_CORE_PATH}/switch/cumulus/none/leaf_yaml.j2"; then
+        print_error "Failed to copy leaf_yaml.j2"
+        exit 1
+    fi
+    print_info "Copied leaf_yaml.j2"
 
     print_step "Creating netplan symlinks..."
     sudo docker exec "${CONTAINER_NAME}" ln -sf \
@@ -560,7 +649,16 @@ apply_patch() {
         "${HOST_DIR}/linux_networkd_spectrum-x.sh" \
         "${HOST_DIR}/netplan_networkd_spectrum-x.sh" 2>/dev/null || true
 
-    print_info "Patch applied successfully"
+    # Verify the patch was actually applied
+    if sudo docker exec "${CONTAINER_NAME}" grep -q "host_subnet_size" \
+        "${SPCX_CORE_PATH}/configurator/ipv4am.py" 2>/dev/null; then
+        print_info "Patch verified: host_subnet_size found in ipv4am.py"
+    else
+        print_error "PATCH VERIFICATION FAILED: host_subnet_size NOT found in ipv4am.py"
+        exit 1
+    fi
+
+    print_info "Patch applied and verified successfully"
 }
 
 # =============================================================================
@@ -690,7 +788,7 @@ validate_switch_configs() {
     # Check for correct subnet size
     local expected_subnet="/${SUBNET_SIZE}"
     local subnet_count=$(sudo docker exec "${CONTAINER_NAME}" \
-        grep -c "${expected_subnet}" "${switch_config}" 2>/dev/null || echo "0")
+        grep -c "${expected_subnet}" "${switch_config}" 2>/dev/null | tr -d '\r\n' | grep -oE '^[0-9]+' || echo "0")
 
     if [[ "$subnet_count" -gt 0 ]]; then
         print_pass "Switch config contains ${expected_subnet} subnets (${subnet_count} found)"
@@ -700,7 +798,7 @@ validate_switch_configs() {
 
     # Check all 4 hosts are connected
     local host_count=$(sudo docker exec "${CONTAINER_NAME}" \
-        grep -c "to_hgx-su00-h0" "${switch_config}" 2>/dev/null || echo "0")
+        grep -c "to_hgx-su00-h0" "${switch_config}" 2>/dev/null | tr -d '\r\n' | grep -oE '^[0-9]+' || echo "0")
 
     if [[ "$host_count" -ge 4 ]]; then
         print_pass "All hosts connected in switch config (${host_count} connections)"
