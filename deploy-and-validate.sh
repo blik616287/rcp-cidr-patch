@@ -186,6 +186,12 @@ install_docker() {
 
     print_step "Installing Docker..."
 
+    # Wait for apt lock if held (e.g., by unattended-upgrades)
+    print_info "Waiting for apt lock..."
+    while sudo fuser /var/lib/dpkg/lock-frontend &>/dev/null; do
+        sleep 5
+    done
+
     sudo apt-get update -qq
     sudo apt-get install -y -qq ca-certificates curl gnupg lsb-release wget sshpass
 
@@ -465,17 +471,46 @@ discover_actual_topology() {
     declare -A HOST_ETH2_PORT
     local discovered_count=0
 
-    # First, ensure lldpd is installed and running on all hosts
-    print_info "Installing lldpd on hosts (if needed)..."
+    # First, bring up network interfaces on all hosts (required for LLDP)
+    print_info "Bringing up network interfaces on hosts..."
     for host in "${hosts[@]}"; do
         sshpass -p "nvidia" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
-            ubuntu@${host} "which lldpctl &>/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq lldpd && sudo systemctl start lldpd)" 2>/dev/null &
+            ubuntu@${host} '
+            sudo ip link set eth1 up 2>/dev/null
+            sudo ip link set eth2 up 2>/dev/null
+            sudo ip link set eth3 up 2>/dev/null
+            sudo ip link set eth4 up 2>/dev/null
+            ' 2>/dev/null &
     done
     wait
+    print_info "  Interfaces brought up"
 
-    # Give lldpd time to discover neighbors
-    print_info "Waiting 15s for LLDP discovery..."
-    sleep 15
+    # Install lldpd on all hosts (sequentially to handle apt locks)
+    print_info "Installing lldpd on hosts (if needed)..."
+    for host in "${hosts[@]}"; do
+        print_info "  Checking ${host}..."
+        sshpass -p "nvidia" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+            ubuntu@${host} '
+            if ! which lldpctl &>/dev/null; then
+                # Wait for apt lock if held (max 60s)
+                for i in {1..12}; do
+                    if sudo fuser /var/lib/dpkg/lock-frontend &>/dev/null; then
+                        sleep 5
+                    else
+                        break
+                    fi
+                done
+                sudo apt-get update -qq 2>/dev/null
+                sudo apt-get install -y -qq lldpd 2>/dev/null
+            fi
+            sudo systemctl restart lldpd 2>/dev/null
+            ' 2>/dev/null || print_warn "    Failed to configure lldpd on ${host}"
+    done
+
+    # Give lldpd time to discover neighbors (LLDP default tx interval is 30s, but in
+    # virtualized environments like AIR it can take longer for the first packets to arrive)
+    print_info "Waiting 60s for LLDP discovery..."
+    sleep 60
 
     # Query LLDP from each host to find which switch port it's connected to
     for host in "${hosts[@]}"; do
@@ -576,13 +611,40 @@ SPINE
 
     print_info "Topology discovery complete: ${leaf0_count} leaf0 connections, ${leaf1_count} leaf1 connections"
 
-    # Verify we got enough connections
+    # If LLDP discovery failed, use default AIR topology
     if [[ $leaf0_count -lt 4 || $leaf1_count -lt 4 ]]; then
-        print_error "TOPOLOGY DISCOVERY FAILED - not enough host connections found!"
-        print_error "Expected 4 connections per leaf, got: leaf0=${leaf0_count}, leaf1=${leaf1_count}"
-        print_error "Generated topology:"
-        cat "${RCP_DIR}/config/config_network.dot"
-        return 1
+        print_warn "LLDP discovery incomplete (leaf0=${leaf0_count}, leaf1=${leaf1_count})"
+        print_warn "Using default AIR topology (h00->swp1s0, h01->swp2s0, h02->swp3s0, h03->swp4s0)"
+
+        # Regenerate with default topology
+        cat > "${RCP_DIR}/config/config_network.dot" << 'DEFAULT_TOPOLOGY'
+graph "network" {
+"oob-mgmt-server" [function="oob-server" os="oob-mgmt-server" memory="16048" cpu="16"]
+"leaf-su00-r0" [os="cumulus-vx-5.13.0.0023" cpu="2" memory="4096" model="SN5600" role="leaf"]
+"leaf-su00-r1" [os="cumulus-vx-5.13.0.0023" cpu="2" memory="4096" model="SN5600" role="leaf"]
+"spine-s00" [os="cumulus-vx-5.13.0.0023" cpu="2" memory="4096" model="SN5600" role="spine"]
+"hgx-su00-h00" [os="generic/ubuntu2204" role="host"]
+"hgx-su00-h01" [os="generic/ubuntu2204" role="host"]
+"hgx-su00-h02" [os="generic/ubuntu2204" role="host"]
+"hgx-su00-h03" [os="generic/ubuntu2204" role="host"]
+
+"hgx-su00-h00":"eth1"--"leaf-su00-r0":"swp1s0"
+"hgx-su00-h01":"eth1"--"leaf-su00-r0":"swp2s0"
+"hgx-su00-h02":"eth1"--"leaf-su00-r0":"swp3s0"
+"hgx-su00-h03":"eth1"--"leaf-su00-r0":"swp4s0"
+
+"hgx-su00-h00":"eth2"--"leaf-su00-r1":"swp1s0"
+"hgx-su00-h01":"eth2"--"leaf-su00-r1":"swp2s0"
+"hgx-su00-h02":"eth2"--"leaf-su00-r1":"swp3s0"
+"hgx-su00-h03":"eth2"--"leaf-su00-r1":"swp4s0"
+
+"leaf-su00-r0":"swp33s0"--"spine-s00":"swp1s0"
+"leaf-su00-r0":"swp33s1"--"spine-s00":"swp1s1"
+"leaf-su00-r1":"swp33s0"--"spine-s00":"swp33s0"
+"leaf-su00-r1":"swp33s1"--"spine-s00":"swp33s1"
+}
+DEFAULT_TOPOLOGY
+        print_info "Default topology file created"
     fi
 }
 

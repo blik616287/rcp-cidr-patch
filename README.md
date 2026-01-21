@@ -134,6 +134,44 @@ docker cp patches/leaf_yaml.j2 spectrum-x-rcp:/usr/local/lib/python3.12/dist-pac
 ./apply-cidr-patch.sh -r
 ```
 
+### Full Automated Deployment (NVIDIA AIR)
+
+For end-to-end deployment on NVIDIA AIR simulation environments, use the `deploy-and-validate.sh` script:
+
+```bash
+chmod +x deploy-and-validate.sh
+./deploy-and-validate.sh [OPTIONS]
+```
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `-s, --subnet-size SIZE` | Subnet size: 29, 30, or 31 (default: 30) |
+| `-c, --container NAME` | Container name (default: spectrum-x-rcp) |
+| `-h, --help` | Show help message |
+| `--skip-docker` | Skip Docker installation (if already installed) |
+| `--skip-patch` | Skip patch application (if already applied) |
+| `--validate-only` | Only run validation tests |
+
+**Examples:**
+
+```bash
+# Full deployment with /30 subnets (default)
+./deploy-and-validate.sh
+
+# Full deployment with /29 subnets
+./deploy-and-validate.sh -s 29
+
+# Only run validation tests
+./deploy-and-validate.sh --validate-only
+
+# Skip Docker install and use custom container name
+./deploy-and-validate.sh --skip-docker -c my-rcp-container
+```
+
+The script performs: Docker installation, RCP image loading, topology discovery via LLDP, patch application, RCP configuration, and comprehensive validation tests.
+
 ## Configuration
 
 After applying the patch, add the `host_subnet_size` parameter to your `config.yaml`:
@@ -380,9 +418,11 @@ docker exec spectrum-x-rcp rcp-tool all configure
 ```
 rcp-cidr-patch/
 ├── README.md                    # This documentation
+├── CLAUDE.md                    # AI assistant guidance for Claude Code
 ├── DEPLOYMENT-GUIDE.md          # Step-by-step NVIDIA AIR deployment
 ├── VALIDATION.md                # Test procedures and validation guide
 ├── apply-cidr-patch.sh          # Installation script
+├── deploy-and-validate.sh       # End-to-end automated deployment
 ├── generate_rail_cidrpools.sh   # Netplan to CIDRPool converter
 ├── sample-config.yaml           # Example configuration
 ├── patches/
