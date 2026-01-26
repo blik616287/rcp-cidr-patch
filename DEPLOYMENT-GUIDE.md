@@ -8,11 +8,13 @@ The NVIDIA RCP tool originally generates `/31` subnets for host IP allocation, p
 
 ### Use Cases
 
-| Subnet | IPs/Block | Usable | Use Case |
-|--------|-----------|--------|----------|
-| `/31` | 2 | 1 host | Original design |
-| `/30` | 4 | 3 (1 host + 2 pods) | 2 GPUs, 1 pod/GPU |
-| `/29` | 8 | 7 (1 host + 6 pods) | 4+ GPUs, 1 pod/GPU |
+| Subnet | IPs/Block | Usable for Pods | Use Case |
+|--------|-----------|-----------------|----------|
+| `/31` | 2 | 0 (host only) | Original design - host-level networking |
+| `/30` | 4 | 0 (host only) | Not recommended - same as /31 due to network/broadcast |
+| `/29` | 8 | 4 pods + 1 host | Multi-pod: 4 GPUs with 1 pod/GPU |
+
+**Note:** `/30` provides no additional pod IPs over `/31` because the .0 (network) and .3 (broadcast) addresses are unusable. For multi-pod scenarios, use `/29`.
 
 ## Quick Start (Automated)
 
@@ -25,11 +27,11 @@ scp -r rcp-cidr-patch ubuntu@oob-mgmt-server:~/
 # SSH to server and run
 ssh ubuntu@oob-mgmt-server
 cd ~/rcp-cidr-patch
-./deploy-and-validate.sh -s 30   # Use /30 subnets
+./deploy-and-validate.sh         # Uses /29 subnets (default, recommended)
 ```
 
 Options:
-- `-s 29|30|31` - Subnet size (default: 30)
+- `-s 29|30|31` - Subnet size (default: 29, use 31 for host-only)
 - `-c <name>` - Container name (default: spectrum-x-rcp)
 - `--skip-docker` - Skip Docker installation
 - `--skip-patch` - Skip patch application
