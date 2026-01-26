@@ -23,7 +23,7 @@
 # Configuration
 # =============================================================================
 
-SUBNET_SIZE=30
+SUBNET_SIZE=29
 CONTAINER_NAME="spectrum-x-rcp"
 SKIP_DOCKER=false
 SKIP_PATCH=false
@@ -98,7 +98,7 @@ Usage:
     $0 [OPTIONS]
 
 Options:
-    -s, --subnet-size SIZE   Subnet size: 29, 30, or 31 (default: 30)
+    -s, --subnet-size SIZE   Subnet size: 29, 30, or 31 (default: 29)
     -c, --container NAME     Container name (default: spectrum-x-rcp)
     -h, --help               Show this help message
     --skip-docker            Skip Docker installation
@@ -106,19 +106,19 @@ Options:
     --validate-only          Only run validation tests
 
 Examples:
-    # Full deployment with /30 subnets
+    # Full deployment with /29 subnets (default, recommended for multi-pod)
     $0
 
-    # Full deployment with /29 subnets
-    $0 -s 29
+    # Full deployment with /31 subnets (host-only)
+    $0 -s 31
 
     # Only run validation
     $0 --validate-only
 
 Subnet Size Reference:
-    /29 = 8 addresses per block (6 usable)
-    /30 = 4 addresses per block (2 usable)
-    /31 = 2 addresses per block (2 usable, point-to-point)
+    /29 = 8 addresses per block (1 host + 4 pods, 1 gateway, network/broadcast unusable)
+    /30 = 4 addresses per block (1 host only, same as /31 - not recommended)
+    /31 = 2 addresses per block (1 host, point-to-point)
 
 EOF
 }

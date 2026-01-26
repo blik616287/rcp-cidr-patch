@@ -19,11 +19,13 @@ Host 1, eth2: 172.18.0.2/31
 
 With configurable subnet sizes:
 
-| Subnet | Addresses/Block | Host IPs | Switch IP | Use Case |
-|--------|-----------------|----------|-----------|----------|
-| `/31` (default) | 2 | 1 | 1 | Host-level only |
-| `/30` | 4 | 3 | 1 | 2 GPUs, 1 pod each |
-| `/29` | 8 | 7 | 1 | 4+ GPUs, 1 pod each |
+| Subnet | Addresses/Block | Host | Gateway | Pods | Use Case |
+|--------|-----------------|------|---------|------|----------|
+| `/31` (default) | 2 | 1 | 1 | 0 | Host-level only |
+| `/30` | 4 | 1 | 1 | 0 | Not recommended (same as /31) |
+| `/29` | 8 | 1 | 1 | 4 | Multi-pod: 4 GPUs, 1 pod each |
+
+**Note:** `/30` subnets are effectively useless for multi-pod scenarios because the .0 (network) and .3 (broadcast) addresses are not usable, leaving no room for pods. Use `/29` for multi-pod deployments.
 
 ## Files Modified
 
@@ -192,11 +194,11 @@ host_subnet_size: 30
 
 ### Configuration Options
 
-| Value | Subnet | Addresses | Description |
-|-------|--------|-----------|-------------|
-| `31` | /31 | 2 | Default. 1 IP for host, 1 for switch. Host-level only. |
-| `30` | /30 | 4 | 1 IP for host, 1 for switch, 2 extra for pods. |
-| `29` | /29 | 8 | 1 IP for host, 1 for switch, 6 extra for pods. |
+| Value | Subnet | Addresses | Usable for Pods | Description |
+|-------|--------|-----------|-----------------|-------------|
+| `31` | /31 | 2 | 0 | Default. 1 IP for host, 1 for switch. Host-level only. |
+| `30` | /30 | 4 | 0 | Not recommended. Same as /31 due to network/broadcast addresses. |
+| `29` | /29 | 8 | 4 | 1 host (.2), 1 gateway (.1), 4 pods (.3-.6), network (.0) and broadcast (.7) unusable. |
 
 ## IP Address Allocation
 
@@ -290,27 +292,30 @@ metadata:
   namespace: nvidia-network-operator
 spec:
   cidr: 172.16.0.0/15
-  gatewayIndex: 0
-  perNodeNetworkPrefix: 31
+  gatewayIndex: 1          # Gateway at .1 position within each block
+  perNodeNetworkPrefix: 29
   routes:
     - dst: 172.16.0.0/15
     - dst: 172.16.0.0/12
   staticAllocations:
     - gateway: 172.16.0.1
       nodeName: hgx-su00-h00
-      prefix: 172.16.0.0/31
-    - gateway: 172.16.0.3
+      prefix: 172.16.0.0/29   # Network address, NOT host address
+    - gateway: 172.16.0.9
       nodeName: hgx-su00-h01
-      prefix: 172.16.0.2/31
-    - gateway: 172.16.0.5
+      prefix: 172.16.0.8/29
+    - gateway: 172.16.0.17
       nodeName: hgx-su00-h02
-      prefix: 172.16.0.4/31
-    - gateway: 172.16.0.7
+      prefix: 172.16.0.16/29
+    - gateway: 172.16.0.25
       nodeName: hgx-su00-h03
-      prefix: 172.16.0.6/31
+      prefix: 172.16.0.24/29
 ```
 
-Note: Use `perNodeNetworkPrefix` (not `perNodeBlockSize`) and `staticAllocations` to ensure the correct IPs are assigned to each host.
+**Important CIDRPool requirements:**
+- `gatewayIndex: 1` - Gateway is at the .1 position within each subnet block
+- `prefix` in staticAllocations must be the **network address** (e.g., `172.16.0.0/29`), not the host address (`172.16.0.2/29`)
+- First pod IP assigned will be `.2` (the host address), then `.3`, `.4`, etc.
 
 ### Generating CIDRPool YAMLs from Netplan
 

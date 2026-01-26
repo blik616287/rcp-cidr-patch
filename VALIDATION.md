@@ -8,11 +8,13 @@ The NVIDIA RCP tool originally generates `/31` subnets for host IP allocation, w
 
 ### Use Cases for Larger Subnets
 
-| Subnet | Addresses | Usable IPs | Use Case |
-|--------|-----------|------------|----------|
-| `/31` | 2 | 1 for host | Original design - 1 pod per NIC |
-| `/30` | 4 | 3 for node (1 host + 2 pods) | 2 GPUs with 1 pod per GPU |
-| `/29` | 8 | 7 for node (1 host + 6 pods) | 4+ GPUs with 1 pod per GPU |
+| Subnet | Addresses | Usable for Pods | Use Case |
+|--------|-----------|-----------------|----------|
+| `/31` | 2 | 0 (host only) | Original design - host-level networking |
+| `/30` | 4 | 0 (host only) | Not recommended - same as /31 due to network/broadcast |
+| `/29` | 8 | 4 pods + 1 host | Multi-pod: 4 GPUs with 1 pod per GPU |
+
+**Note:** `/30` provides no additional pod IPs over `/31` because the .0 (network) and .3 (broadcast) addresses are unusable. For multi-pod scenarios, use `/29`.
 
 ---
 
@@ -241,8 +243,9 @@ sshpass -p "nvidia" ssh -o StrictHostKeyChecking=no ubuntu@hgx-su00-h00 '
 **Key Points:**
 - Host IP at `.2` position (not `.0` which is network address)
 - Gateway at `.1` position
-- Addresses `.3-.6` available for pods
-- `.7` is broadcast (unusable)
+- Addresses `.3-.6` available for pods (4 total)
+- `.0` is network address (unusable)
+- `.7` is broadcast address (unusable)
 
 ### Verify on Running Hosts
 

@@ -60,34 +60,35 @@ host_configurator: "netplan"
 #                  Use case: Host-level only (no container networking)
 #
 #   30           - /30 subnet, 4 addresses per block
-#                  1 for host base, 1 for switch, 2 extra for containers
-#                  Use case: 2 GPUs running 1 pod each
+#                  NOT RECOMMENDED: same as /31 due to network/broadcast addresses
+#                  1 for host, 1 for switch, .0 and .3 unusable
 #
 #   29           - /29 subnet, 8 addresses per block
-#                  1 for host base, 1 for switch, 6 extra for containers
-#                  Use case: 4+ GPUs running 1 pod each
+#                  1 for host (.2), 1 for switch (.1), 4 for pods (.3-.6)
+#                  .0 (network) and .7 (broadcast) unusable
+#                  Use case: 4 GPUs running 1 pod each
 #
 # IP Address Layout Example (for host index 0, rail 0):
 #
-#   /31 (default):
+#   /31 (default, point-to-point):
 #     172.16.0.0 - Host
-#     172.16.0.1 - Switch
+#     172.16.0.1 - Switch/Gateway
 #
-#   /30:
-#     172.16.0.0 - Host base IP
-#     172.16.0.1 - Switch
-#     172.16.0.2 - Container/Pod IP 1
-#     172.16.0.3 - Container/Pod IP 2
+#   /30 (NOT RECOMMENDED - no pod IPs available):
+#     172.16.0.0 - Network address (unusable)
+#     172.16.0.1 - Switch/Gateway
+#     172.16.0.2 - Host
+#     172.16.0.3 - Broadcast (unusable)
 #
-#   /29:
-#     172.16.0.0 - Host base IP
-#     172.16.0.1 - Switch
-#     172.16.0.2 - Container/Pod IP 1
-#     172.16.0.3 - Container/Pod IP 2
-#     172.16.0.4 - Container/Pod IP 3
-#     172.16.0.5 - Container/Pod IP 4
-#     172.16.0.6 - Container/Pod IP 5
-#     172.16.0.7 - Container/Pod IP 6
+#   /29 (RECOMMENDED for multi-pod):
+#     172.16.0.0 - Network address (unusable)
+#     172.16.0.1 - Switch/Gateway
+#     172.16.0.2 - Host
+#     172.16.0.3 - Pod IP 1
+#     172.16.0.4 - Pod IP 2
+#     172.16.0.5 - Pod IP 3
+#     172.16.0.6 - Pod IP 4
+#     172.16.0.7 - Broadcast (unusable)
 #
 # ============================================================================
-host_subnet_size: 30
+host_subnet_size: 29  # Use 29 for multi-pod, 31 for host-only

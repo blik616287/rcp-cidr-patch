@@ -5,6 +5,12 @@ set -euo pipefail
 # Usage:
 #   ./generate_rail_cidrpools.sh -i ./data -o ./out [-n nvidia-network-operator]
 #
+# Generates NV-IPAM CIDRPool YAMLs from RCP-generated netplan configs.
+#
+# IMPORTANT: CIDRPool staticAllocations require:
+#   - prefix: must be the NETWORK address (e.g., 172.16.0.0/29), not host address
+#   - gatewayIndex: 1 (gateway is at .1 position within each block)
+#
 # Requires:
 #   - yq v4+   (brew install yq)
 #   - jq       (brew install jq)
@@ -136,8 +142,31 @@ for FILE in "${INPUT_DIR}"/hgx-su*.yaml; do
     [[ "$GATEWAY" == "null" ]] && GATEWAY=""
 
     if [[ -n "$PREFIX" && -n "$GATEWAY" ]]; then
+      # Convert host address to network address for CIDRPool prefix
+      # e.g., 172.16.0.2/29 -> 172.16.0.0/29
+      # The host IP is at .2 within the block, we need the .0 network address
+      HOST_IP="${PREFIX%/*}"
+      PREFIX_LEN="${PREFIX##*/}"
+
+      # Calculate network address: clear host bits based on prefix length
+      if [[ "$PREFIX_LEN" =~ ^[0-9]+$ ]]; then
+        # Convert IP to integer, mask off host bits, convert back
+        IFS='.' read -r a b c d <<< "$HOST_IP"
+        IP_INT=$(( (a << 24) + (b << 16) + (c << 8) + d ))
+        MASK=$(( 0xFFFFFFFF << (32 - PREFIX_LEN) & 0xFFFFFFFF ))
+        NET_INT=$(( IP_INT & MASK ))
+        NET_A=$(( (NET_INT >> 24) & 0xFF ))
+        NET_B=$(( (NET_INT >> 16) & 0xFF ))
+        NET_C=$(( (NET_INT >> 8) & 0xFF ))
+        NET_D=$(( NET_INT & 0xFF ))
+        NETWORK_PREFIX="${NET_A}.${NET_B}.${NET_C}.${NET_D}/${PREFIX_LEN}"
+      else
+        # Fallback: use original prefix if we can't parse
+        NETWORK_PREFIX="$PREFIX"
+      fi
+
       current="${RAIL_ALLOC_JSON[$r]}"
-      NEW=$(jq -c --arg gw "$GATEWAY" --arg nn "$NODENAME" --arg pf "$PREFIX" \
+      NEW=$(jq -c --arg gw "$GATEWAY" --arg nn "$NODENAME" --arg pf "$NETWORK_PREFIX" \
         '. + [{"gateway":$gw, "nodeName":$nn, "prefix":$pf}]' <<<"$current")
       RAIL_ALLOC_JSON[$r]="$NEW"
     else
@@ -171,7 +200,7 @@ while [[ $r -le $NUM_RAILS ]]; do
       metadata: { name: $name, namespace: $ns },
       spec: {
         cidr: $cidr,
-        gatewayIndex: 0,
+        gatewayIndex: 1,
         perNodeNetworkPrefix: $prefix,
         routes: $routes,
         staticAllocations: $allocs
