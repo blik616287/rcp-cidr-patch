@@ -473,4 +473,4 @@ rcp-cidr-patch/
 
 ## License
 
-This patch modifies NVIDIA proprietary software. Use in accordance with NVIDIA licensing terms.
+[MIT](LICENSE) © 2026 Martin Forde <mforde84@gmail.com>, [Blik Labs](https://bliklabs.com).
